@@ -25,6 +25,12 @@ set -uo pipefail
 # =============================================================================
 
 UCX_DEBUG=${UCX_DEBUG:-0}
+# CONFIRMED via check_cxi_libfabric.sh probe (both nodes, 2026-08-19): fi_info -p cxi
+# works, libfabric 2.3.1, and NIXL's plugin manager lists LIBFABRIC as loadable in
+# this exact conda env. Defaulting to it -- NIXL's own default backend is UCX, and
+# plain UCX has no native Slingshot/CXI transport (see handoff doc). Override to
+# UCX for an explicit A/B comparison once LIBFABRIC is confirmed working end-to-end.
+NIXL_BACKEND=${NIXL_BACKEND:-LIBFABRIC}
 MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
 STAMP=$(date +%Y%m%d_%H%M%S)
 SHARED=/vast/draco/tara/projects/Tara_Deployment/software/testing/pd_smoke_${STAMP}
@@ -78,6 +84,27 @@ if [ "${UCX_DEBUG}" = "1" ]; then
     echo "*** UCX_DEBUG=1: transport-negotiation diagnostic mode. Logs will be large. ***"
 fi
 
+# GPU_ID intentionally NOT set by default -- CUDA_VISIBLE_DEVICES is left
+# unset, so all GPUs on the node stay visible to the process. Was previously
+# hardcoded to 0; removed per explicit ask, for two reasons:
+#   1. Hardcoding to GPU 0 is exactly the kind of thing that silently breaks
+#      once this script grows into the real sweep (Section 6) and needs a
+#      specific GPU per role on a multi-GPU node -- easy to forget it's there.
+#   2. Logical inference, NOT confirmed against NIXL's source: the LIBFABRIC
+#      backend does topology-aware GPU-to-NIC rail selection (NUMA-aware,
+#      PCI-bus-ID-based, per NIXL's own release notes). Restricting GPU
+#      visibility to one device could hand that logic a degenerate view of
+#      the node's topology. Leaving all GPUs visible avoids the risk for free
+#      -- vLLM still defaults to tensor-parallel-size=1 and lands on the
+#      first visible device, so this smoke test's behavior is unchanged.
+# To pin a specific GPU for a future run, set GPU_ID rather than editing this
+# file, e.g.: GPU_ID=2 bash run_pd_full_test_N2_R1.sh
+GPU_PIN_LINE=""
+if [ -n "${GPU_ID:-}" ]; then
+    GPU_PIN_LINE="export CUDA_VISIBLE_DEVICES=${GPU_ID}"
+    echo "GPU_ID=${GPU_ID} set -- pinning CUDA_VISIBLE_DEVICES=${GPU_ID} for both P and D."
+fi
+
 cat > ${SHARED}/common_env.sh <<EOF
 export HTTP_PROXY=http://proxy.alcf.anl.gov:3128
 export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128
@@ -99,7 +126,7 @@ export TMPDIR=/tmp
 export VLLM_LOGGING_LEVEL=DEBUG
 export UCX_TLS=cuda_copy,cuda_ipc,sm,tcp,self
 export UCX_MODULE_DIR=\$(python3 -c "import site,glob; print(glob.glob(site.getsitepackages()[0]+'/nixl_cu13.libs/ucx')[0])")
-export CUDA_VISIBLE_DEVICES=0
+${GPU_PIN_LINE}
 ${UCX_LOG_LINE}
 EOF
 
@@ -211,6 +238,13 @@ EOF
 # prompt, D could serve the second one from ITS OWN local prefix cache
 # instead of actually pulling KV from the producer -- which would look fast
 # for the wrong reason and silently invalidate the Q1 timing comparison.
+# NIXL backend selection lives in kv_connector_extra_config.backends (per vLLM's
+# NixlConnector docs). Leaving this unset defaults NIXL to UCX -- which is the
+# whole reason last session's run couldn't have passed Q3 regardless of UCX_TLS
+# tuning. NIXL_BACKEND=UCX still works if you want an explicit A/B later.
+KV_XFER_CONFIG_P="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"backends\":[\"${NIXL_BACKEND}\"]}}"
+KV_XFER_CONFIG_D="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"backends\":[\"${NIXL_BACKEND}\"]}}"
+
 cat > ${SHARED}/launch_p.sh <<EOF
 #!/bin/bash
 source ${SHARED}/common_env.sh
@@ -219,7 +253,7 @@ export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
 vllm serve ${MODEL} --host 0.0.0.0 --port ${P_PORT} \\
     --gpu-memory-utilization 0.3 \\
     --no-enable-prefix-caching \\
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
+    --kv-transfer-config '${KV_XFER_CONFIG_P}'
 EOF
 
 cat > ${SHARED}/launch_d.sh <<EOF
@@ -230,8 +264,9 @@ export VLLM_NIXL_SIDE_CHANNEL_PORT=5601
 vllm serve ${MODEL} --host 0.0.0.0 --port ${D_PORT} \\
     --gpu-memory-utilization 0.3 \\
     --no-enable-prefix-caching \\
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
+    --kv-transfer-config '${KV_XFER_CONFIG_D}'
 EOF
+echo "NIXL backend for this run: ${NIXL_BACKEND}"
 
 # --- Launch both -------------------------------------------------------------
 ssh -n "${NODE_P}" "bash ${SHARED}/launch_p.sh" > ${SHARED}/logs/p.log 2>&1 &
@@ -251,6 +286,12 @@ TAIL_D_PID=$!
 
 cleanup() {
     echo "=== Cleaning up ==="
+    # CXI poll loops are setsid'd specifically so they survive an SSH session
+    # closing -- which means they ALSO survive this script dying early, same
+    # orphan-process problem as EngineCore below. Stop marker is a no-op if
+    # the poll never started (POLL_STOP_MARKER unset under `set -u` is guarded
+    # with :-).
+    touch "${POLL_STOP_MARKER:-}" 2>/dev/null
     # Signaling the local ssh client PIDs does NOT reach the remote vllm
     # serve processes -- no pty was allocated, so the remote shell has
     # nothing to forward a signal through. SIGTERM the actual remote
@@ -408,12 +449,13 @@ echo ""
 echo "=== Proxy wired in -- running Q1b/Q2 for real ==="
 echo ""
 
-# --- Q2: interface counters, bracketed tightly around the disagg request ---
-# NOTE: for a tiny smoke-test model + short prompt, the actual KV payload
-# moved may be small enough that the byte-delta signal is hard to distinguish
-# from background noise (health-check polling, etc). If the delta looks
-# ambiguous, rerun with a longer PROMPT specifically for this check -- more
-# tokens means more KV to move, means a clearer signal on the wire.
+# --- Q2 (legacy, kept as a cheap secondary signal) ---------------------------
+# CAVEAT (confirmed architecture fact, not just a small-model noise problem):
+# CXI RDMA is exposed via a kernel-bypass character device, separate from the
+# hsn0 netdevice/classical-Ethernet path these /proc/net/dev counters read.
+# A real CXI RDMA transfer may not register here at all, regardless of model
+# size -- this is why the CXI sysfs polling below is now the primary check,
+# not this one.
 snapshot_counters() {
     local tag=$1
     for n in "${NODE_P}" "${NODE_D}"; do
@@ -421,14 +463,82 @@ snapshot_counters() {
     done
 }
 
-echo "=== Q2: interface counters BEFORE disagg request ==="
+# --- Q2, real signal: CXI hardware octet counters, sampled DURING the request,
+# not just before/after. Confirmed real path + counter names via
+# check_cxi_libfabric.sh probe on both nodes (2026-08-19):
+#   /sys/class/cxi/cxi<0-3>/device/telemetry/hni_sts_{tx,rx}_ok_octets
+# Polls all 4 CXI devices per node (don't yet know which one is rail-aligned
+# to CUDA_VISIBLE_DEVICES=0 on this system -- cheaper to poll all 4 and let
+# the data show which moved than to assume cxi0<->GPU0).
+cat > ${SHARED}/poll_cxi.sh <<'POLLEOF'
+#!/bin/bash
+STOP_MARKER="$1"
+OUT="$2"
+while [ ! -f "${STOP_MARKER}" ]; do
+    ts=$(date +%s.%N)
+    for i in 0 1 2 3; do
+        tx=$(cat /sys/class/cxi/cxi${i}/device/telemetry/hni_sts_tx_ok_octets 2>/dev/null)
+        rx=$(cat /sys/class/cxi/cxi${i}/device/telemetry/hni_sts_rx_ok_octets 2>/dev/null)
+        echo "${ts},cxi${i},tx=${tx},rx=${rx}" >> "${OUT}"
+    done
+    sleep 0.05
+done
+POLLEOF
+
+POLL_STOP_MARKER="${SHARED}/poll_stop_${STAMP}"
+start_cxi_poll() {
+    local node=$1 outfile=$2
+    : > "${outfile}"
+    # setsid+nohup+disown so the loop survives this ssh session closing --
+    # same class of issue the handoff doc already hit with EngineCore cleanup
+    # (signaling the local ssh client PID doesn't reach the remote process).
+    ssh -n "$node" "setsid nohup bash ${SHARED}/poll_cxi.sh ${POLL_STOP_MARKER} ${outfile} > /dev/null 2>&1 < /dev/null &" 
+}
+stop_cxi_poll() {
+    touch "${POLL_STOP_MARKER}"
+    sleep 0.3   # >1 poll interval, let both remote loops notice and exit
+}
+summarize_cxi_poll() {
+    local outfile=$1 label=$2
+    echo "  -- ${label} --"
+    if [ ! -s "${outfile}" ]; then
+        echo "    (no samples captured -- poll loop may not have started; check permissions on the telemetry files)"
+        return
+    fi
+    awk -F'[,=]' '
+        { dev=$2
+          if (!(dev in txfirst)) { txfirst[dev]=$4; rxfirst[dev]=$6 }
+          txlast[dev]=$4; rxlast[dev]=$6; n[dev]++
+        }
+        END {
+          for (d in txlast) printf "    %s: %d samples, tx_delta=%d bytes, rx_delta=%d bytes\n", d, n[d], txlast[d]-txfirst[d], rxlast[d]-rxfirst[d]
+        }' "${outfile}" | sort
+}
+
+echo "=== Q2 (legacy/secondary): interface counters BEFORE disagg request ==="
 snapshot_counters "before"
+
+echo "=== Q2 (real signal): starting CXI octet-counter polling on both nodes ==="
+start_cxi_poll "${NODE_P}" "${SHARED}/logs/cxi_poll_p.csv"
+start_cxi_poll "${NODE_D}" "${SHARED}/logs/cxi_poll_d.csv"
+sleep 0.2   # let both pollers get at least one sample before the request fires
 
 echo "=== Q1b: disagg request, through the proxy ==="
 send_and_time ${P_IP} ${PROXY_PORT} "disagg_via_proxy"
 
-echo "=== Q2: interface counters AFTER disagg request ==="
+sleep 0.2   # capture at least one post-request sample before stopping
+stop_cxi_poll
+
+echo "=== Q2 (legacy/secondary): interface counters AFTER disagg request ==="
 snapshot_counters "after"
+
+echo "=== Q2 (real signal): CXI octet deltas during the request window ==="
+echo "  A non-zero tx/rx delta on ONE specific device, on both P and D, during"
+echo "  this exact window is the actual evidence -- not the /proc/net/dev numbers"
+echo "  above. Full time series in ${SHARED}/logs/cxi_poll_{p,d}.csv if you want"
+echo "  to look at the shape rather than just the delta."
+summarize_cxi_poll "${SHARED}/logs/cxi_poll_p.csv" "Prefill (${NODE_P})"
+summarize_cxi_poll "${SHARED}/logs/cxi_poll_d.csv" "Decode (${NODE_D})"
 
 echo "=== Q1 verdict: compare baseline_decode_alone vs disagg_via_proxy above ==="
 echo "disagg time_starttransfer should be noticeably LOWER than baseline if a"
