@@ -86,4 +86,46 @@ set -- ${RANK_ARGS[@]+"${RANK_ARGS[@]}"}
 
 export LD_PRELOAD="${SCRIPT_DIR}/fi_getinfo_shim.so"
 
+# BLOCKER 3: fi_writedata failed on rail 0: Flags not supported (-FI_EBADFLAGS)
+#
+# NIXL's libfabric rail posts the MAIN DATA PATH with fi_writedata(), riding
+# the transfer id in the RMA immediate data. That is free on EFA. On CXI the
+# feature is OPT-IN and off by default, so domain_attr->cq_data_size
+# negotiates to 0 and every write is rejected. Per fi_cxi(7):
+#
+#   "Controls provider support for the fi_writedata() and
+#    fi_inject_writedata() RMA operations... This option is disabled by
+#    default... Application support for FI_MR_PROV_KEY mr_mode is required
+#    to use this feature."
+#
+# The FI_MR_PROV_KEY prerequisite is already met by the shim's mask:
+#   0x674 = FI_MR_LOCAL(1<<2) | FI_MR_VIRT_ADDR(1<<4) | FI_MR_ALLOCATED(1<<5)
+#         | FI_MR_PROV_KEY(1<<6) | FI_MR_ENDPOINT(1<<9) | FI_MR_HMEM(1<<10)
+#
+# MEASURED -- do not re-derive any of this:
+#
+#  a) `fi_info -p cxi -v | grep cq_data_size` reports 8 with AND without the
+#     variable set. cq_data_size is the DOMAIN ATTRIBUTE ("the hardware can
+#     carry 8 bytes of CQ data"), a PRECONDITION of the feature, not a
+#     readout of whether it is switched on. Not a usable test.
+#
+#  b) THE KNOB DOES NOT EXIST IN THIS LIBFABRIC BUILD. All 72 knobs from
+#     `fi_info -e 2>&1 | grep -a -oE 'FI_CXI_[A-Z0-9_]+' | sort -u` were
+#     enumerated; FI_CXI_ENABLE_WRITEDATA is not among them. It postdates
+#     this version. The export below is therefore a NO-OP here -- kept only
+#     so it starts working if libfabric is ever upgraded.
+#
+#  c) NIXL 1.4.0 has NO fi_write fallback. `strings` on
+#     libplugin_LIBFABRIC.so shows exactly four data-path ops:
+#         fi_writedata   (RMA write -- carries FI_REMOTE_CQ_DATA, REJECTED by cxi)
+#         fi_read        (RMA read  -- no immediate data, should be fine)
+#         fi_senddata    (message send; CQ data on MSG is supported by cxi)
+#         fi_recvmsg
+#     So WRITE is unreachable on this stack, but READ should work.
+#
+# CONSEQUENCE: use --op READ. That is also what the real workload does --
+# vLLM's NixlConnector is a PULL (NixlPullConnectorWorker): decode reads KV
+# from prefill. vLLM never issues the WRITE path at all.
+export FI_CXI_ENABLE_WRITEDATA="${FI_CXI_ENABLE_WRITEDATA:-1}"
+
 exec python3 "${SCRIPT_DIR}/repro_nixl_2rank_transfer.py" "$@"

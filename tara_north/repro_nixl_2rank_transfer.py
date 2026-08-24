@@ -200,6 +200,13 @@ def main():
     if not vni:
         log("WARNING: SLINGSHOT_VNIS is empty. fi_domain() will almost certainly fail.")
 
+    fi_env = {k: v for k, v in sorted(os.environ.items()) if k.startswith("FI_")}
+    log(f"FI_* env: {fi_env or '<none>'}")
+    if os.environ.get("FI_CXI_ENABLE_WRITEDATA") not in ("1", "true", "yes"):
+        log("WARNING: FI_CXI_ENABLE_WRITEDATA is not set. NIXL posts its data path with "
+            "fi_writedata(), which CXI disables by default -- expect "
+            "'fi_writedata failed ...: Flags not supported'.")
+
     sync_dir = Path(args.sync_dir or
                     f"/vast/draco/tara/projects/Tara_Deployment/software/testing/"
                     f"nixl_2rank_{os.environ.get('PALS_APID', 'noapid')}")
@@ -388,7 +395,13 @@ def main():
     else:
         for k, v in deltas.items():
             log(f"  {k:12s} {v:>18,d} octets  ({human(v)})")
-        interesting = "tx" if rank == 0 else "rx"
+        # Which direction should move depends on the op, not just the role.
+        # WRITE: initiator pushes  -> initiator tx, target rx.
+        # READ:  initiator pulls   -> initiator rx, target tx.
+        if args.op == "WRITE":
+            interesting = "tx" if rank == 0 else "rx"
+        else:
+            interesting = "rx" if rank == 0 else "tx"
         moved = sum(v for k, v in deltas.items() if k.endswith(interesting))
         log(f"  total {interesting}: {human(moved)} vs {human(total)} payload "
             f"-> {moved / total:.2f}x")
