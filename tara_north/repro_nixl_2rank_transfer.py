@@ -72,16 +72,61 @@ three modes measure around it rather than fight it:
                     at once. This is the shape vLLM actually runs (TP=N, one
                     rank per GPU), so the node total is the figure that
                     matters for the deployment. Launch with -n 2N -ppn N.
+                    MEASURED (4 pairs, 4 GiB, READ, VRAM): all four rails
+                    carried 16.26 GiB each, 1.02x of payload; per-pair means
+                    21.9-22.5 GB/s; NODE 87.67 GB/s envelope / 89.40 GB/s
+                    sum-of-rates. That is 87.7% of the node's 100 GB/s line
+                    rate and 92% of 4x the solo per-pair best, i.e. sharing
+                    the host costs about 5% and nothing else is lost.
+
+                    SO THE 1:1 PARTITION IS NOT A PROBLEM FOR vLLM. One GPU
+                    is capped at 25 GB/s, but four GPUs saturate the node,
+                    and TP=4 is one rank per GPU by construction.
 
   --mode solo-peak  1 rank per node, but the wrapper hands hwloc an XML
-                    topology with all but one GPU deleted. num_groups
-                    becomes 1, so that GPU inherits all 4 NICs. Diagnostic
-                    only: it shows a single GPU can saturate the fabric. It
-                    is not a configuration anyone should ship.
+                    topology with all but one GPU deleted, on the theory that
+                    num_groups would become 1 and that GPU would inherit all
+                    4 NICs.
+
+                    TESTED, AND THE THEORY IS WRONG. The prune itself works
+                    (3 of 4 GPUs removed, kept 0009:01:00.0, CUDA bound to
+                    its UUID) and the transfer passes byte-exact -- but the
+                    result is still RAILS CARRYING PAYLOAD: 1 (cxi0) at
+                    23.24 GB/s, indistinguishable from --mode pair.
+
+                    Why: groupNicsWithAccel() Step 4 divides PER ANCESTOR
+                    NODE, not globally --
+
+                        num_groups      = node_group_counts[ancestor]
+                        nics_per_group  = ancestor_nics[ancestor].size()
+                                          / num_groups
+
+                    On this machine each GPU sits in its own PCIe complex
+                    with exactly one NIC, so every ancestor is already 1/1.
+                    Deleting the other three GPUs leaves the survivor's
+                    ancestor holding the same single NIC, and orphans the
+                    other three: Step 3 walks each orphan NIC up looking for
+                    an ancestor with group count > 0, does not find one
+                    (the counts sit on the LOWEST qualifying ancestor, not
+                    the root), and drops them into has_accel = false groups.
+                    getEfaDevicesForPci() never returns those, so VRAM
+                    cannot reach them.
+
+                    NO AMOUNT OF GPU PRUNING FIXES THIS. It would take
+                    relocating the NIC nodes into the surviving GPU's
+                    complex, i.e. rewriting the PCIe tree rather than
+                    trimming it. Not worth it: aggregate already saturates
+                    the fabric, so the only case this would have helped is a
+                    TP=1 worker. Mode kept because it runs clean and
+                    documents the negative result.
 
 DRAM is unaffected by any of this. Its rail policy is separate, and on this
 node it falls back to "all rails" because NUMA detection fails -- which is
-why DRAM reads ~87 GB/s from a single rank while VRAM reads ~24.
+why DRAM reads ~87 GB/s from a SINGLE rank while VRAM reads ~24. Measured
+under the full shim: 87.62 GB/s, 4 rails, 1.02x on both ranks, so the shim
+costs DRAM nothing. Note that ~87 GB/s is also where 4-way aggregate VRAM
+lands, which suggests both are hitting the same fabric ceiling rather than
+any per-path limit.
 
 DESIGN NOTES
 ------------
@@ -605,8 +650,11 @@ def main():
         if args.mode == "aggregate":
             log(f"  (pair {pair_id} alone, on GPU {gpu_index}; node total below)")
         elif args.mem == "cuda":
-            expect = ("all 4 rails, so 100 GB/s" if args.mode == "solo-peak"
-                      else "ONE rail, so 25 GB/s -- see MODES")
+            # solo-peak was MEASURED at 1 rail / 23.24 GB/s -- pruning GPUs
+            # does not hand the survivor the other rails, because the split
+            # is per-PCIe-complex. Do not print 100 GB/s here; it would read
+            # as a failure when the run is behaving exactly as expected.
+            expect = "ONE rail, so 25 GB/s -- see MODES"
             log(f"line rate reference: VRAM in --mode {args.mode} should get {expect}")
         else:
             log("line rate reference: DRAM uses all rails -- 4 x 200 Gbps = 100 GB/s peak")
@@ -748,11 +796,18 @@ def main():
             # If they are close, the pairs really did overlap and either is
             # fine to quote. If they are far apart, the pairs serialised and
             # only the envelope means anything.
+            # 25 GB/s is one 200 Gbps Slingshot NIC. The node cannot exceed
+            # its 4 NICs however the pairs are arranged, so that -- not
+            # npairs x 25 -- is the ceiling once npairs reaches the NIC count.
+            ceiling = min(len(rows), 4) * 25e9
+            env = node_bytes / slowest
             log(f"  node payload per pass: {human(node_bytes)}")
-            log(f"  ENVELOPE (lower bound): {node_bytes / slowest / 1e9:.2f} GB/s")
-            log(f"  SUM OF RATES  (upper) : {sum_rates / 1e9:.2f} GB/s")
-            log(f"  line rate reference: {len(rows)} GPUs x 1 rail = "
-                f"{len(rows) * 25} GB/s, node ceiling 100 GB/s (4 x 200 Gbps)")
+            log(f"  ENVELOPE (lower bound): {env / 1e9:.2f} GB/s"
+                f"   = {env / ceiling * 100:.1f}% of line rate")
+            log(f"  SUM OF RATES  (upper) : {sum_rates / 1e9:.2f} GB/s"
+                f"   = {sum_rates / ceiling * 100:.1f}%")
+            log(f"  line rate: {ceiling / 1e9:.0f} GB/s "
+                f"({min(len(rows), 4)} x 200 Gbps NIC(s))")
             log("  cross-check against the CXI octet deltas above -- those are "
                 "measured on the wire and do not depend on this arithmetic.")
 

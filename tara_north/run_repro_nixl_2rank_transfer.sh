@@ -29,16 +29,30 @@
 #                      what vLLM with TP=N actually does, so it is the number
 #                      that matters for the real workload.
 #                      PPN defaults to the GPU count; override with PPN=<n>.
+#                      MEASURED (4 pairs, 4 GiB, READ, VRAM): 4 rails at
+#                      16.26 GiB each, 1.02x of payload, NODE 87.67 GB/s --
+#                      87.7% of the node's 100 GB/s line rate. The one-rail-
+#                      per-GPU partition costs nothing once you run one rank
+#                      per GPU, which is what TP=N is.
 #
 #   --mode solo-peak              2 ranks, but HWLOC_XMLFILE is pointed at a
-#                      pruned topology with ONE GPU, so that GPU inherits all
-#                      4 rails. DIAGNOSTIC ONLY -- it answers "can one GPU
-#                      saturate the node" and nothing else. Needs
-#                      lstopo-no-graphics and nvidia-smi on the compute node.
+#                      pruned topology with ONE GPU, on the theory that the
+#                      survivor would inherit all 4 rails.
+#                      MEASURED: IT DOES NOT. The prune works (3 of 4 GPUs
+#                      removed, CUDA bound by UUID) and the transfer passes
+#                      byte-exact, but the result is still 1 rail / cxi0 /
+#                      23.24 GB/s -- identical to --mode pair. The NIC split
+#                      in groupNicsWithAccel() is PER PCIe COMPLEX, and each
+#                      complex here already holds 1 GPU + 1 NIC, so removing
+#                      GPUs elsewhere changes nothing and merely orphans the
+#                      other three NICs into accel-less groups that VRAM can
+#                      never reach. See the MODES block in the Python for the
+#                      full walk-through. Kept as a documented negative.
+#                      Needs lstopo-no-graphics and nvidia-smi on the node.
 #
 # `--mem cuda` depends on the BLOCKER 4 workaround inside fi_getinfo_shim.c,
 # which is on by default. NIXL_CXI_VRAM_SHIM=0 turns it off and restores the
-# old DRAM-only behaviour -- use that to A/B the DRAM path (see below).
+# old DRAM-only behaviour.
 #
 # --op defaults to READ: it is vLLM's direction and the only one this stack
 # supports. See BLOCKER 3 below.
@@ -166,10 +180,12 @@ set -- ${RANK_ARGS[@]+"${RANK_ARGS[@]}"}
 #
 # NIXL_CXI_VRAM_SHIM=0 disables the BLOCKER 4 half only.
 #
-# WORTH MEASURING: riding the EFA branch also makes hasPcieDevices() true, so
-# DRAM rail selection can switch from "all rails" to NUMA-aware and pick a
-# SUBSET of rails. Re-run `--mem dram` with NIXL_CXI_VRAM_SHIM unset and =0
-# and compare before trusting the DRAM number in the BLOCKER 3 block below.
+# MEASURED, and it is fine: riding the EFA branch makes hasPcieDevices() true,
+# which could in principle switch DRAM rail selection from "all rails" to
+# NUMA-aware and pick a SUBSET. It does not. `--mem dram` under the full shim
+# still reports RAILS CARRYING PAYLOAD: 4 at 87.62 GB/s, because NUMA
+# detection fails before the policy can narrow anything (rail_manager :620 ->
+# :271, all-rails fallback). Details in the BLOCKER 3 block below.
 export LD_PRELOAD="${SCRIPT_DIR}/fi_getinfo_shim.so"
 
 # BLOCKER 3: fi_writedata failed on rail 0: Flags not supported (-FI_EBADFLAGS)
@@ -209,16 +225,32 @@ export LD_PRELOAD="${SCRIPT_DIR}/fi_getinfo_shim.so"
 #         fi_recvmsg
 #     So WRITE is unreachable on this stack, but READ should work.
 #
-# MEASURED with READ, 2 nodes x 1 rank, 4 GiB DRAM, 64 x 64 MiB descriptors:
+# MEASURED with READ, 2 nodes x 1 rank, 4 GiB DRAM, 64 x 64 MiB descriptors,
+# WITH the full shim loaded (PATCHES 1-4 all firing):
 #   query_xfer_backend -> LIBFABRIC        (Q1: no silent fallback)
 #   destination buffer byte-exact          (Q2: pass)
-#   best 0.049s -> 87.39 GB/s, mean 65.75 GB/s vs a 100 GB/s 4-rail peak
-#   initiator rx 1.02x of payload          (Q3: pass on the initiator)
-#   target    tx 0.77x of payload          (Q3: NOT yet clean on the target)
-# The target shortfall was a sampling artifact, not a transport one -- its
-# four NICs disagreed by ~75 MB in read order while the initiator's agreed to
-# 512 bytes. The Python now settles the telemetry caches before sampling; the
-# target figure above predates that and is expected to move. Do not quote it.
+#   best 0.049s -> 87.62 GB/s, mean 75.98 GB/s vs a 100 GB/s 4-rail peak
+#   RAILS CARRYING PAYLOAD: 4 (cxi0..cxi3), 4.06 GiB each, evenly spread
+#   initiator rx 1.02x of payload          (Q3: pass)
+#   target    tx 1.02x of payload          (Q3: pass)
+#
+# Both ranks now read 1.02x. An earlier run had the target at 0.77x, which was
+# a SAMPLING artifact and not a transport one -- its four NICs disagreed by
+# ~75 MB in read order while the initiator's agreed to 512 bytes. The Python
+# settles the telemetry caches before sampling now, and that closed it.
+#
+# THE SHIM DOES NOT COST DRAM ANY RAILS -- this was the open worry, since
+# riding the EFA branch makes hasPcieDevices() true and could in principle
+# flip DRAM from "all rails" to a NUMA-aware subset. It does not, because
+# NUMA detection fails first: libfabric_rail_manager.cpp:620 still logs
+# "Could not deduce average bandwidth limit per NUMA node" and :271 falls back
+# to the all-rails policy. So DRAM gets all 4 rails for the same reason it
+# always did, and the shim is irrelevant to it. Caveat unchanged: if that NUMA
+# detection is ever fixed, DRAM may drop to a subset and this number moves.
+#
+# For scale: DRAM 1 rank = 87.62 GB/s and VRAM 4 ranks = 87.67 GB/s land on
+# the same figure, so ~87 GB/s is a shared fabric/host ceiling rather than
+# anything path-specific.
 #
 # CONSEQUENCE: READ is the DEFAULT --op in the Python. That is also what the
 # real workload does -- vLLM's NixlConnector is a PULL
