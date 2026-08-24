@@ -13,6 +13,29 @@
 #     bash run_repro_nixl_2rank_transfer.sh --gib 16 --mem cuda
 #     bash run_repro_nixl_2rank_transfer.sh --op WRITE     # reproduces BLOCKER 3
 #
+# MODES
+# -----
+# NIXL binds each GPU to ONE Slingshot rail (see MODES in the Python's module
+# docstring for the derivation), so "how fast is VRAM over the fabric" has
+# three different honest answers. --mode picks which one you are asking for,
+# and THIS SCRIPT PICKS THE LAUNCH SHAPE TO MATCH -- do not set -n/-ppn by
+# hand unless you also set NRANKS/PPN here.
+#
+#   --mode pair        (default)  2 ranks, 1 per node, GPU 0 <-> GPU 0.
+#                      One rail. ~24 GB/s. What we have been running.
+#
+#   --mode aggregate              2N ranks, N per node, rank i on GPU i.
+#                      N rails concurrently, reports the NODE total. This is
+#                      what vLLM with TP=N actually does, so it is the number
+#                      that matters for the real workload.
+#                      PPN defaults to the GPU count; override with PPN=<n>.
+#
+#   --mode solo-peak              2 ranks, but HWLOC_XMLFILE is pointed at a
+#                      pruned topology with ONE GPU, so that GPU inherits all
+#                      4 rails. DIAGNOSTIC ONLY -- it answers "can one GPU
+#                      saturate the node" and nothing else. Needs
+#                      lstopo-no-graphics and nvidia-smi on the compute node.
+#
 # `--mem cuda` depends on the BLOCKER 4 workaround inside fi_getinfo_shim.c,
 # which is on by default. NIXL_CXI_VRAM_SHIM=0 turns it off and restores the
 # old DRAM-only behaviour -- use that to A/B the DRAM path (see below).
@@ -48,10 +71,41 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ---- --mode, read by BOTH halves -----------------------------------------
+# The launcher half needs it to choose -n/-ppn; the rank half needs it to
+# decide whether to build the pruned hwloc topology. Parsed here, before the
+# positional parameters get stashed around the conda source below, so the
+# value survives that.
+MODE="pair"
+_prev=""
+for _a in "$@"; do
+    case "${_prev}" in --mode) MODE="${_a}" ;; esac
+    case "${_a}" in --mode=*) MODE="${_a#--mode=}" ;; esac
+    _prev="${_a}"
+done
+case "${MODE}" in
+    pair|aggregate|solo-peak) ;;
+    *) echo "ERROR: unknown --mode '${MODE}' (pair|aggregate|solo-peak)" >&2; exit 2 ;;
+esac
+
 # ---- Launcher half: only runs when we are NOT yet a PALS rank ------------
 if [ -z "${PMI_RANK:-}" ]; then
-    NRANKS=${NRANKS:-2}
+    if [ "${MODE}" = "aggregate" ] && [ -z "${PPN:-}" ]; then
+        # One rank per GPU is the whole point of the mode. `|| true` because
+        # grep -c exits 1 on no match and pipefail would kill the script
+        # before the sanity check below gets to say something useful.
+        PPN=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)
+        if ! [ "${PPN:-0}" -gt 0 ] 2>/dev/null; then
+            echo "ERROR: --mode aggregate could not count GPUs (nvidia-smi -L)." >&2
+            echo "       Set PPN=<gpus per node> explicitly." >&2
+            exit 1
+        fi
+        echo "aggregate: ${PPN} GPU(s) per node -> -ppn ${PPN}"
+    fi
     PPN=${PPN:-1}
+    # Two nodes, PPN ranks each. Pairing is by hostname in the Python, so the
+    # rank ordering PALS happens to use does not matter.
+    NRANKS=${NRANKS:-$((PPN * 2))}
 
     # Add --single-node-vni only when the allocation really is one node.
     # On a multi-node allocation PALS provisions the VNI anyway, and we do
@@ -172,5 +226,49 @@ export LD_PRELOAD="${SCRIPT_DIR}/fi_getinfo_shim.so"
 # issues the WRITE path at all. `--op WRITE` is still accepted and still
 # fails here, so the blocker stays reproducible on demand.
 export FI_CXI_ENABLE_WRITEDATA="${FI_CXI_ENABLE_WRITEDATA:-1}"
+
+# ---- solo-peak: hand hwloc a topology with exactly one GPU ----------------
+# NIXL divides NICs by accelerator count (groupNicsWithAccel Step 4:
+# nics_per_group = nics.size() / num_groups). 4 GPUs / 4 NICs = 1 rail each.
+# Show hwloc a single GPU and num_groups becomes 1, so that GPU gets all 4.
+# There is no NIXL-side knob for this -- max_bw_per_dram_seg is the only
+# LIBFABRIC tunable and it is DRAM-only. See prune_hwloc_xml.py.
+#
+# This runs in the RANK half because lstopo has to describe the node it runs
+# on, and each node builds its own.
+if [ "${MODE}" = "solo-peak" ]; then
+    for _tool in lstopo-no-graphics nvidia-smi; do
+        command -v "${_tool}" >/dev/null 2>&1 || {
+            echo "ERROR: --mode solo-peak needs ${_tool} on PATH." >&2; exit 1; }
+    done
+
+    SOLO_DIR="${TMPDIR:-/tmp}/nixl_solo_${PALS_APID:-$$}"
+    mkdir -p "${SOLO_DIR}"
+
+    # --filter io:all keeps every PCI device. hwloc's default IO filter is
+    # "important only", and a GPU whose driver did not register an OSDev can
+    # be dropped by it -- which would prune the topology for us, silently and
+    # by the wrong criterion.
+    lstopo-no-graphics --filter io:all --of xml > "${SOLO_DIR}/full.xml" 2>/dev/null \
+        || lstopo-no-graphics --whole-io --of xml > "${SOLO_DIR}/full.xml"
+
+    # Pick the GPU from nvidia-smi rather than from the XML, so the device we
+    # KEEP and the device we point CUDA at cannot disagree. nvidia-smi prints
+    # an 8-digit PCI domain (00000000:0F:00.0); hwloc prints 4 (0000:0f:00.0).
+    # Normalise, or --keep will never match and the pruner will bail.
+    SOLO_LINE=$(nvidia-smi --query-gpu=pci.bus_id,uuid --format=csv,noheader | sort | head -1)
+    SOLO_BDF=$(printf '%s' "${SOLO_LINE%%,*}" | tr 'A-Z' 'a-z' \
+               | sed -E 's/^0+([0-9a-f]{4}:)/\1/')
+    SOLO_UUID=$(printf '%s' "${SOLO_LINE#*,}" | tr -d ' ')
+
+    python3 "${SCRIPT_DIR}/prune_hwloc_xml.py" \
+        "${SOLO_DIR}/full.xml" "${SOLO_DIR}/solo.xml" --keep "${SOLO_BDF}" >/dev/null
+
+    export HWLOC_XMLFILE="${SOLO_DIR}/solo.xml"
+    # By UUID, not by index: with the topology pruned, "GPU 0" means different
+    # things to torch and to NIXL unless the binding is unambiguous.
+    export CUDA_VISIBLE_DEVICES="${SOLO_UUID}"
+    echo "solo-peak: kept GPU ${SOLO_BDF} (${SOLO_UUID}), HWLOC_XMLFILE=${HWLOC_XMLFILE}"
+fi
 
 exec python3 "${SCRIPT_DIR}/repro_nixl_2rank_transfer.py" "$@"
