@@ -68,7 +68,21 @@ fi
 
 # ---- Rank half ------------------------------------------------------------
 cd "${SCRIPT_DIR}"
+
+# A sourced script INHERITS the caller's positional parameters, and conda's
+# `bin/activate` reads $1 as the environment name. Sourcing the env script
+# with our own args still set makes conda go looking for an environment
+# literally named "--dump-api". Stash the args, clear them, source, restore.
+#
+# errexit/nounset are also lifted across the source: conda's activation
+# machinery has unset-variable reads and non-zero intermediate returns that
+# are harmless interactively but fatal under `set -eu`.
+RANK_ARGS=( "$@" )
+set --
+set +eu
 source ./env_for_libfabric_topology_error.sh
+set -eu
+set -- ${RANK_ARGS[@]+"${RANK_ARGS[@]}"}
 
 export LD_PRELOAD="${SCRIPT_DIR}/fi_getinfo_shim.so"
 
