@@ -101,8 +101,14 @@ set -- ${RANK_ARGS[@]+"${RANK_ARGS[@]}"}
 #              `provider_name == "efa"` and hardcodes num_nvidia_accel = 0
 #              for everything else, so on Slingshot it concludes the node has
 #              no GPUs. The shim relabels the DISCOVERED provider cxi -> efa
-#              (device names untouched) so the GPU scan runs, then rewrites
-#              the later "efa" hints back to cxi so the data path stays CXI.
+#              (device names untouched) so the GPU scan runs, then undoes the
+#              spoof on the way back down so the data path stays 100% CXI.
+#              Undoing it takes TWO patches, because provider_name is used as
+#              a behavioural switch in two different ways: topology hints get
+#              their prov_name rewritten efa -> cxi, while the per-rail hints
+#              carry NO prov_name at all and instead pick their mr_mode by
+#              string-matching the provider -- so those get the missing
+#              FI_MR_ENDPOINT / FI_RMA_EVENT / mr_key_size=0 put back.
 #
 # NIXL_CXI_VRAM_SHIM=0 disables the BLOCKER 4 half only.
 #

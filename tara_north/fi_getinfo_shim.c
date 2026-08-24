@@ -18,8 +18,8 @@
  * setting, for cxi, the exact mr_mode mask used below.
  *
  *
- * BLOCKER 4 (no VRAM_SEG on cxi) -- fixed by PATCHES 2+3 below
- * ------------------------------------------------------------
+ * BLOCKER 4 (no VRAM_SEG on cxi) -- fixed by PATCHES 2+3+4 below
+ * --------------------------------------------------------------
  * `--mem cuda` fails with:
  *     registerMem: no available backends for mem type 'VRAM_SEG'
  *
@@ -84,12 +84,27 @@
  *   e) Nothing ever compares the returned prov_name against the requested
  *      one, so the spoof is not detected.
  *
- * The cost of (a) is that NIXL now ASKS for "efa" on its later fi_getinfo
- * calls -- buildPcieToLibfabricMapping() (topology.cpp:496) and each
- * nixlLibfabricRail ctor copy provider_name straight into
- * hints->fabric_attr->prov_name. Left alone those would request a provider
- * this machine does not have and fail. PATCH 3 turns them back into "cxi" on
- * the way in, so the real data path stays 100% CXI.
+ * THE COST OF (a) is that provider_name is not just a label -- downstream
+ * code uses it as a BEHAVIOURAL SWITCH, in two different ways, so the spoof
+ * has to be undone in two different ways:
+ *
+ *   COST 1: buildPcieToLibfabricMapping() (topology.cpp:496) copies
+ *      provider_name straight into hints->fabric_attr->prov_name. Left alone
+ *      it would request a provider this machine does not have and fail.
+ *      PATCH 3 rewrites that "efa" back to "cxi" on the way in.
+ *
+ *   COST 2: the nixlLibfabricRail ctor (libfabric_rail.cpp:420-436) does NOT
+ *      set prov_name at all -- it string-switches on the provider to pick an
+ *      mr_mode PROFILE, then narrows by domain_attr->name:
+ *          provider == "cxi" -> mr_mode 0x674 (has FI_MR_ENDPOINT),
+ *                               caps |= FI_RMA_EVENT, mr_key_size left 0
+ *          else ("EFA and    -> mr_mode 0x474 (NO FI_MR_ENDPOINT),
+ *           other providers")   mr_key_size = 2
+ *      There is no prov_name for PATCH 3 to catch, so the spoof silently
+ *      downgrades every rail to the EFA profile, and CXI answers -FI_ENODATA
+ *      ("fi_getinfo failed for rail 0: No data available"). The ctor's one
+ *      retry only drops FI_HMEM from caps and leaves the wrong mr_mode, so it
+ *      fails too. PATCH 4 restores the cxi profile.
  *
  * "cxi" and "efa" are both exactly 3 bytes, so every rewrite here is an
  * in-place memcpy. No allocation, no free, nothing for fi_freeinfo to get
@@ -97,16 +112,19 @@
  *
  * SCOPE: PATCH 2 fires on ONE precisely fingerprinted call (no prov_name AND
  * mr_mode == ~3 -- that is getAvailableNetworkDevices() and nothing else).
- * PATCH 3 fires only on hints that literally say "efa". On a real EFA machine
- * this shim would be inert for PATCH 2 (the returned name is already "efa")
- * and PATCH 3 would rewrite efa->cxi wrongly -- so do not use it there. It is
- * a Slingshot-only tool.
+ * PATCH 3 fires only on hints that literally say "efa". PATCH 4 fires only on
+ * hints naming a "cxi*" domain, which is the rail ctor and nothing else --
+ * the discovery call and buildPcieToLibfabricMapping() both leave
+ * domain_attr->name NULL. On a real EFA machine this shim would be inert for
+ * PATCH 2 (the returned name is already "efa") and for PATCH 4 (no cxi
+ * domains), while PATCH 3 would rewrite efa->cxi wrongly -- so do not use it
+ * there. It is a Slingshot-only tool.
  *
  *
  * KILL SWITCH
  * -----------
- * PATCHES 2+3 are on by default. To get exactly the old behaviour (BLOCKER 1
- * fix only, DRAM only, no VRAM):
+ * PATCHES 2+3+4 are on by default. To get exactly the old behaviour (BLOCKER
+ * 1 fix only, DRAM only, no VRAM):
  *     export NIXL_CXI_VRAM_SHIM=0
  *
  * Worth A/B-ing: riding the EFA branch also makes hasPcieDevices() true, so
@@ -149,6 +167,11 @@
 /* The mr_mode getAvailableNetworkDevices() uses, and no other NIXL call
  * does. Half of the fingerprint that identifies the discovery call. */
 #define DISCOVERY_MR_MODE (~3)
+
+/* Prefix of the libfabric domain names for Slingshot NICs ("cxi0".."cxi3").
+ * nixlLibfabricRail puts the device name in domain_attr->name, which is how
+ * PATCH 4 recognises a rail call. */
+#define CXI_DOMAIN_PREFIX "cxi"
 
 typedef int (*fi_getinfo_fn)(uint32_t version,
                              const char *node,
@@ -261,6 +284,42 @@ fi_getinfo(uint32_t version,
         fprintf(stderr,
                 "[fi_getinfo_shim] PATCH 1: patched cxi hints, set domain_attr->mr_mode = 0x%x\n",
                 (unsigned)CXI_MR_MODE);
+    }
+
+    /* PATCH 4 (BLOCKER 4, second half): repair the per-rail hints.
+     *
+     * nixlLibfabricRail's ctor (libfabric_rail.cpp:420-436) never sets
+     * prov_name at all -- it uses the provider STRING as a behavioural
+     * switch to choose an mr_mode profile, then filters by
+     * domain_attr->name. So PATCH 3 has nothing to rewrite there, and our
+     * spoof silently sends it down the "EFA and other providers"
+     * else-branch:
+     *
+     *   cxi branch  : mr_mode 0x674 (incl. FI_MR_ENDPOINT), caps |= FI_RMA_EVENT,
+     *                 mr_key_size untouched (0)
+     *   else branch : mr_mode 0x474 (NO FI_MR_ENDPOINT), mr_key_size = 2
+     *
+     * CXI rejects the else-branch combination with -FI_ENODATA, which is
+     * exactly the "fi_getinfo failed for rail 0: No data available" we saw.
+     * Restore the profile the cxi branch would have produced.
+     *
+     * Fires only on rail calls: buildPcieToLibfabricMapping() and the
+     * discovery call both leave domain_attr->name NULL. Idempotent, so the
+     * ctor's retry-without-FI_HMEM path is handled too. We deliberately do
+     * NOT re-add FI_RMA_EVENT on that retry -- NIXL's own retry resets caps
+     * unconditionally for cxi as well, so this matches real cxi behaviour. */
+    if (vram_shim_on() && h && h->domain_attr && h->domain_attr->name &&
+        strncmp(h->domain_attr->name, CXI_DOMAIN_PREFIX, 3) == 0 &&
+        (((h->domain_attr->mr_mode & FI_MR_ENDPOINT) == 0) ||
+         h->domain_attr->mr_key_size != 0)) {
+
+        h->domain_attr->mr_mode |= FI_MR_ENDPOINT;
+        h->domain_attr->mr_key_size = 0; /* the cxi branch never sets this */
+        h->caps |= FI_RMA_EVENT;
+        fprintf(stderr,
+                "[fi_getinfo_shim] PATCH 4: restored cxi rail hints for domain %s"
+                " (mr_mode = 0x%x, mr_key_size = 0, +FI_RMA_EVENT)\n",
+                h->domain_attr->name, (unsigned)h->domain_attr->mr_mode);
     }
 
     int ret = real_fi_getinfo(version, node, service, flags, hints, info);
