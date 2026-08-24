@@ -261,17 +261,15 @@ def main():
     base = buf.data_ptr()
     tuples = [(base + i * chunk_bytes, chunk_bytes, dev_id) for i in range(nchunks)]
 
-    def make_descs(tups, cuda):
-        # The mem_type spelling moved around across NIXL versions; try the
-        # one the current upstream examples use, then the older enum names.
-        for name in (("cuda", "cpu"), ("VRAM", "DRAM")):
-            try:
-                return agent.get_xfer_descs(tups, mem_type=name[0] if cuda else name[1])
-            except Exception:
-                continue
-        raise RuntimeError("get_xfer_descs rejected every mem_type spelling")
+    # agent.nixl_mems is the authoritative table of accepted mem_type
+    # spellings in this build -- consult it rather than guessing. Upstream
+    # examples use "cuda"/"cpu"; older builds only know "VRAM"/"DRAM".
+    accepted = getattr(agent, "nixl_mems", None) or {}
+    wanted = ("cuda", "VRAM") if device.startswith("cuda") else ("cpu", "DRAM")
+    mem_type = next((m for m in wanted if m in accepted), wanted[-1])
+    log(f"mem_type='{mem_type}' (agent.nixl_mems knows: {sorted(accepted) or 'unavailable'})")
 
-    local_descs = make_descs(tuples, device.startswith("cuda"))
+    local_descs = agent.get_xfer_descs(tuples, mem_type=mem_type)
     if not local_descs:
         sys.exit("ERROR: get_xfer_descs returned nothing.")
 
@@ -307,6 +305,18 @@ def main():
         if not handle:
             sys.exit("ERROR: initialize_xfer returned no handle.")
 
+        # Q3, at the NIXL layer. This asks NIXL which backend it actually
+        # bound this transfer to -- attribution independent of the hardware
+        # counters below. If this says LIBFABRIC *and* the CXI octets move,
+        # there is no room left for a silent fallback.
+        try:
+            chosen = agent.query_xfer_backend(handle)
+            log(f"query_xfer_backend -> {chosen}")
+            if chosen and args.backend.upper() not in str(chosen).upper():
+                log(f"WARNING: transfer bound to '{chosen}', not {args.backend}.")
+        except Exception as exc:
+            log(f"query_xfer_backend unavailable ({exc}) -- relying on CXI counters alone")
+
         def one_pass():
             t0 = time.perf_counter()
             if agent.transfer(handle) == "ERR":
@@ -330,6 +340,13 @@ def main():
 
         after = read_cxi_counters()
         _publish(sync_dir, "xfer_complete")
+
+        try:
+            tele = agent.get_xfer_telemetry(handle)
+            if tele:
+                log(f"NIXL transfer telemetry: {tele}")
+        except Exception:
+            pass
 
         best = min(times)
         total = nbytes * (args.iters + args.warmup)
