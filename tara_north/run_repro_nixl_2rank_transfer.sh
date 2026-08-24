@@ -13,6 +13,10 @@
 #     bash run_repro_nixl_2rank_transfer.sh --gib 16 --mem cuda
 #     bash run_repro_nixl_2rank_transfer.sh --op WRITE     # reproduces BLOCKER 3
 #
+# `--mem cuda` depends on the BLOCKER 4 workaround inside fi_getinfo_shim.c,
+# which is on by default. NIXL_CXI_VRAM_SHIM=0 turns it off and restores the
+# old DRAM-only behaviour -- use that to A/B the DRAM path (see below).
+#
 # --op defaults to READ: it is vLLM's direction and the only one this stack
 # supports. See BLOCKER 3 below.
 #
@@ -87,6 +91,25 @@ source ./env_for_libfabric_topology_error.sh
 set -eu
 set -- ${RANK_ARGS[@]+"${RANK_ARGS[@]}"}
 
+# The shim now carries TWO workarounds; see the header of fi_getinfo_shim.c
+# for the full derivation of each.
+#
+#   BLOCKER 1  cxi hints left mr_mode == 0 -> -FI_ENODATA -> backend aborts.
+#   BLOCKER 4  cxi never advertises VRAM_SEG, so `--mem cuda` dies in
+#              registerMem with "no available backends for mem type
+#              'VRAM_SEG'". NIXL gates accelerator discovery behind
+#              `provider_name == "efa"` and hardcodes num_nvidia_accel = 0
+#              for everything else, so on Slingshot it concludes the node has
+#              no GPUs. The shim relabels the DISCOVERED provider cxi -> efa
+#              (device names untouched) so the GPU scan runs, then rewrites
+#              the later "efa" hints back to cxi so the data path stays CXI.
+#
+# NIXL_CXI_VRAM_SHIM=0 disables the BLOCKER 4 half only.
+#
+# WORTH MEASURING: riding the EFA branch also makes hasPcieDevices() true, so
+# DRAM rail selection can switch from "all rails" to NUMA-aware and pick a
+# SUBSET of rails. Re-run `--mem dram` with NIXL_CXI_VRAM_SHIM unset and =0
+# and compare before trusting the DRAM number in the BLOCKER 3 block below.
 export LD_PRELOAD="${SCRIPT_DIR}/fi_getinfo_shim.so"
 
 # BLOCKER 3: fi_writedata failed on rail 0: Flags not supported (-FI_EBADFLAGS)
