@@ -76,12 +76,24 @@ from pathlib import Path
 # Kernel-bypass RDMA never touches /proc/net/dev, so these per-NIC sysfs
 # telemetry files are the only place the bytes show up. Format is
 # "<value>@<timestamp>" on this platform; parse defensively anyway.
+#
+# The value is NOT read straight off the hardware -- it comes from a per-NIC
+# cache that the driver refreshes on its own schedule, and the timestamp is
+# when that refresh happened, not when we opened the file. Everything below
+# about settling exists because of that one fact.
 
 CXI_TELEMETRY = "/sys/class/cxi/cxi{i}/device/telemetry/hni_sts_{dir}_ok_octets"
 
 
 def read_cxi_counters(max_nics=8):
-    counters = {}
+    """One instantaneous sample: ({key: octets}, {key: raw_timestamp}).
+
+    The timestamp's units are not documented on this platform, so it is
+    carried through as an opaque string and only logged -- nothing branches
+    on it. It is here so the next run tells us what it is, and so a stale
+    sample is visible rather than inferred.
+    """
+    counters, stamps = {}, {}
     for i in range(max_nics):
         for direction in ("tx", "rx"):
             path = CXI_TELEMETRY.format(i=i, dir=direction)
@@ -90,12 +102,64 @@ def read_cxi_counters(max_nics=8):
                     raw = fh.read().strip()
             except OSError:
                 continue
-            token = raw.split("@")[0].split()[0]
+            head, _, stamp = raw.partition("@")
+            fields = head.split()
+            if not fields:
+                continue
             try:
-                counters[f"cxi{i}.{direction}"] = int(token)
+                counters[f"cxi{i}.{direction}"] = int(fields[0])
             except ValueError:
                 continue
-    return counters
+            if stamp.strip():
+                stamps[f"cxi{i}.{direction}"] = stamp.strip()
+    return counters, stamps
+
+
+def read_cxi_counters_settled(window, poll=0.25, timeout=30.0):
+    """Sample until the counters hold still for `window` seconds.
+
+    A fixed sleep is a guess, and "two consecutive reads agree" is worse than
+    a guess: two reads landing inside one refresh interval agree trivially
+    while the value is still stale. Only stillness across a window LONGER
+    than the refresh interval shows the cache has caught up. `window` must
+    therefore over-estimate that interval, which is why it defaults high.
+
+    This is not hypothetical. Sampling the target the instant the transfer
+    ended gave tx totals of 3.05 / 3.09 / 3.11 / 3.12 GiB across cxi0..cxi3
+    -- ascending in read order, a ~75 MB staleness gradient -- summing to
+    0.77x of payload. The initiator's four NICs, which happened to have
+    settled, agreed with each other to within 512 bytes and summed to 1.02x.
+    Four settled NICs agree; four unsettled ones fan out in read order.
+
+    Returns (counters, stamps, info); info carries waited/reads/settled.
+    """
+    # Exact equality is too strict to ever be reached on a shared node: /vast
+    # rides the same fabric, so barrier polling and other background chatter
+    # keep the counters ticking and nothing would ever settle. The tolerance
+    # below accepts drift of ~4 MiB/s at the default poll (so <= 8 MiB per
+    # counter across a 2s window) -- four orders of magnitude under the
+    # ~60 GB/s the transfer itself moves, so it cannot mistake a transfer
+    # tail for quiet, and it cannot hide a missing pass.
+    tol = 1 << 20
+
+    def _quiet(a, b):
+        return all(abs(a.get(k, 0) - b.get(k, 0)) <= tol for k in set(a) | set(b))
+
+    t0 = time.perf_counter()
+    prev, stamps = read_cxi_counters()
+    stable_since, reads = t0, 1
+    while True:
+        time.sleep(poll)
+        cur, stamps = read_cxi_counters()
+        reads += 1
+        now = time.perf_counter()
+        if not _quiet(cur, prev):
+            stable_since = now
+        prev = cur
+        if now - stable_since >= window:
+            return cur, stamps, {"waited": now - t0, "reads": reads, "settled": True}
+        if now - t0 >= timeout:
+            return cur, stamps, {"waited": now - t0, "reads": reads, "settled": False}
 
 
 def diff_counters(before, after):
@@ -144,6 +208,8 @@ def barrier(sync_dir: Path, tag: str, rank: int, size: int, timeout: float = 600
 
 # --------------------------------------------------------------------------
 
+SYNC_ROOT = "/vast/draco/tara/projects/Tara_Deployment/software/testing"
+
 
 def human(nbytes):
     return f"{nbytes / 2**30:.2f} GiB"
@@ -160,16 +226,32 @@ def main():
                     help="timed iterations after the warmup (default: 3)")
     ap.add_argument("--warmup", type=int, default=1,
                     help="untimed warmup iterations, for connection setup (default: 1)")
-    ap.add_argument("--op", choices=("WRITE", "READ"), default="WRITE",
-                    help="WRITE = initiator pushes (default). READ = initiator pulls, "
-                         "which is the direction vLLM's NixlConnector actually uses.")
+    ap.add_argument("--op", choices=("READ", "WRITE"), default="READ",
+                    help="READ = initiator pulls (default), which is both the direction "
+                         "vLLM's NixlConnector uses and the only one that works on this "
+                         "stack. WRITE = initiator pushes; NIXL posts it with "
+                         "fi_writedata(), which this CXI/libfabric build rejects with "
+                         "-FI_EBADFLAGS and NIXL 1.4.0 has no fallback for. Kept "
+                         "selectable so the failure stays reproducible on demand.")
     ap.add_argument("--mem", choices=("dram", "cuda"), default="dram",
                     help="where the buffer lives. dram first -- it isolates the fabric "
                          "from HMEM/GPUDirect concerns. cuda is the real KV-cache path.")
     ap.add_argument("--backend", default="LIBFABRIC")
     ap.add_argument("--sync-dir", default=None,
-                    help="shared rendezvous dir (default: derived from PALS_APID under "
-                         "the /vast testing tree)")
+                    help="shared rendezvous dir. Default is derived from PALS_APID under "
+                         "the /vast testing tree, which makes it unique per run; if you "
+                         "override it, give each run a fresh empty directory")
+    ap.add_argument("--settle", type=float, default=2.0,
+                    help="seconds the CXI counters must hold STILL before a sample is "
+                         "accepted. Must over-estimate the per-NIC telemetry refresh "
+                         "interval, or a stale value passes the stability test trivially "
+                         "(default: 2.0)")
+    ap.add_argument("--settle-timeout", type=float, default=30.0,
+                    help="stop waiting for the counters to settle after this long and "
+                         "report the sample as unsettled (default: 30)")
+    ap.add_argument("--telemetry", action="store_true",
+                    help="call agent.get_xfer_telemetry(); off by default because NIXL "
+                         "logs a loud error unless telemetry was enabled at agent creation")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip byte-exactness check (it is not free on a multi-GiB buffer)")
     ap.add_argument("--dump-api", action="store_true",
@@ -207,10 +289,42 @@ def main():
             "fi_writedata(), which CXI disables by default -- expect "
             "'fi_writedata failed ...: Flags not supported'.")
 
-    sync_dir = Path(args.sync_dir or
-                    f"/vast/draco/tara/projects/Tara_Deployment/software/testing/"
-                    f"nixl_2rank_{os.environ.get('PALS_APID', 'noapid')}")
+    # ---- Rendezvous directory ---------------------------------------------
+    # This MUST be unique per run. If two runs share it, every barrier passes
+    # instantly on the previous run's files and add_remote_agent() gets handed
+    # the PREVIOUS run's metadata -- a silent wrong-answer failure, not a
+    # crash. PALS hands out a per-application id; with no id there is nothing
+    # safe to derive, so refuse instead of guessing.
+    if args.sync_dir:
+        sync_dir = Path(args.sync_dir)
+    else:
+        apid = os.environ.get("PALS_APID")
+        if not apid:
+            sys.exit("ERROR: PALS_APID is unset, so the default rendezvous directory "
+                     "would be shared by every run: barriers would pass on stale files "
+                     "and the metadata exchange would wire up a dead agent from a "
+                     "previous launch. Pass --sync-dir <fresh empty dir> explicitly.")
+        sync_dir = Path(SYNC_ROOT) / f"nixl_2rank_{apid}"
     sync_dir.mkdir(parents=True, exist_ok=True)
+
+    # Belt and braces for an explicit --sync-dir: anything in here that
+    # predates this launch is debris. The peer's files are seconds old at
+    # this point -- both ranks come from one mpiexec -- so age separates the
+    # two cleanly. stat() can lose a race against the peer's atomic replace;
+    # a file that vanishes mid-scan is by definition not stale.
+    now = time.time()
+    stale = []
+    for p in sync_dir.iterdir():
+        try:
+            if now - p.stat().st_mtime > 300.0:
+                stale.append(p.name)
+        except OSError:
+            continue
+    if stale:
+        sys.exit(f"ERROR: {sync_dir} holds {len(stale)} file(s) older than this launch "
+                 f"(e.g. {sorted(stale)[:3]}). Barriers would pass immediately on them. "
+                 f"Delete them or pass a fresh --sync-dir.")
+    log(f"rendezvous: {sync_dir}")
 
     # ---- Guard: the two ranks must be on different nodes ------------------
     # A same-node pass could be served by shm or cxi loopback and would be
@@ -305,7 +419,21 @@ def main():
     barrier(sync_dir, "connected", rank, size)
 
     # ---- Transfer ---------------------------------------------------------
-    before = read_cxi_counters()
+    # Settle the baseline too, not just the post-transfer sample. A stale
+    # baseline reads LOW, which inflates the delta -- the opposite error, and
+    # the one that would manufacture a false pass.
+    before, before_stamps, before_info = read_cxi_counters_settled(
+        args.settle, timeout=args.settle_timeout)
+    log(f"baseline counters settled in {before_info['waited']:.2f}s over "
+        f"{before_info['reads']} reads"
+        + ("" if before_info["settled"] else "  -- NOT STABLE; baseline may be stale"))
+
+    # Neither rank may move data until BOTH hold a baseline. Without this the
+    # initiator finishes settling first and starts transferring while the
+    # target is still inside its settle loop -- the target's counters would
+    # never hold still, so its "before" would land on the far side of the
+    # transfer and its delta would collapse to near zero.
+    barrier(sync_dir, "armed", rank, size)
 
     if rank == 0:
         handle = agent.initialize_xfer(args.op, local_descs, remote_descs, peer_name, b"xfer_done")
@@ -345,18 +473,17 @@ def main():
             times.append(dt)
             log(f"iter {i}: {dt:.3f}s  {nbytes / dt / 1e9:.2f} GB/s")
 
-        after = read_cxi_counters()
         _publish(sync_dir, "xfer_complete")
 
-        try:
-            tele = agent.get_xfer_telemetry(handle)
-            if tele:
-                log(f"NIXL transfer telemetry: {tele}")
-        except Exception:
-            pass
+        if args.telemetry:
+            try:
+                tele = agent.get_xfer_telemetry(handle)
+                if tele:
+                    log(f"NIXL transfer telemetry: {tele}")
+            except Exception as exc:
+                log(f"get_xfer_telemetry unavailable: {exc}")
 
         best = min(times)
-        total = nbytes * (args.iters + args.warmup)
         log("")
         log(f"=== {args.op} {human(nbytes)} x{args.iters} timed ({args.mem}, {nchunks} descriptors) ===")
         log(f"best  {best:.3f}s -> {nbytes / best / 1e9:.2f} GB/s")
@@ -379,16 +506,53 @@ def main():
 
         log("waiting for the initiator to finish...")
         _await(sync_dir, "xfer_complete", timeout=3600.0, on_poll=poll)
-        after = read_cxi_counters()
-        total = nbytes * (args.iters + args.warmup)
+        # Expect ONE FEWER notification than passes, and do not read anything
+        # into it: _await checks for xfer_complete BEFORE calling on_poll, and
+        # the initiator publishes that file the instant its last pass returns
+        # DONE, so the final notification usually arrives with nobody left to
+        # poll for it. A measured run showed 3 of 4. Only zero is interesting.
         log(f"initiator reported complete. notifications received: {len(notif_seen)}"
             + (f" (e.g. {notif_seen[0]})" if notif_seen else " -- none; the notification "
                "path may need a progress thread, this does not invalidate the transfer"))
+
+    # ---- Counter snapshot, taken on BOTH ranks after everything is quiet --
+    # The first version sampled each rank the moment it locally believed the
+    # transfer was over, and produced an asymmetry: initiator rx read 1.02x of
+    # payload while target tx read only 0.77x. The per-NIC breakdown showed
+    # what that was -- the target's four NICs disagreed by ~75 MB in ascending
+    # read order while the initiator's agreed to 512 bytes -- so it was the
+    # sampling instrument, not the transport. Both ranks now sample behind a
+    # common barrier AND wait for the telemetry caches to stop moving. If an
+    # asymmetry survives that, it is real and worth chasing.
+    total = nbytes * (args.iters + args.warmup)
+    barrier(sync_dir, "quiesce", rank, size)
+    after, after_stamps, after_info = read_cxi_counters_settled(
+        args.settle, timeout=args.settle_timeout)
 
     # ---- Q3: did the bytes actually go over Slingshot? --------------------
     deltas = diff_counters(before, after)
     log("")
     log(f"--- CXI hardware octet deltas ({human(total)} of payload crossed this rank) ---")
+    log(f"  sample settled in {after_info['waited']:.2f}s over {after_info['reads']} reads"
+        + ("" if after_info["settled"] else
+           f"  -- NOT STABLE after {args.settle_timeout:.0f}s; the counters were still "
+           "moving, so everything below is a LOWER BOUND"))
+
+    if after_stamps:
+        def _span(stamps):
+            vals = list(stamps.values())
+            try:
+                vals.sort(key=float)
+            except ValueError:
+                vals.sort()
+            return vals[0], vals[-1]
+
+        b_lo, b_hi = _span(before_stamps) if before_stamps else ("?", "?")
+        a_lo, a_hi = _span(after_stamps)
+        log(f"  telemetry stamps: baseline [{b_lo} .. {b_hi}]  sample [{a_lo} .. {a_hi}]")
+        log("  (opaque units. If the sample span sits clear of the baseline span, every "
+            "NIC cache refreshed after the transfer and the deltas are complete.)")
+
     if not deltas:
         log("NO CXI COUNTER MOVEMENT. Either the sysfs telemetry path is wrong on this "
             "node, or the payload did not go over Slingshot.")
@@ -427,10 +591,14 @@ def main():
         log("PASS: destination buffer is byte-exact.")
 
     barrier(sync_dir, "done", rank, size)
-    try:
-        agent.release_xfer_handle(handle)  # noqa: F821  (initiator only)
-    except Exception:
-        pass
+    if rank == 0:
+        # Only the initiator ever built a handle. Guarding on rank, rather
+        # than letting the target raise NameError into a bare except, keeps a
+        # genuine release failure visible instead of silently swallowed.
+        try:
+            agent.release_xfer_handle(handle)
+        except Exception as exc:
+            log(f"release_xfer_handle warning: {exc}")
     try:
         agent.remove_remote_agent(peer_name)
         agent.deregister_memory(reg)

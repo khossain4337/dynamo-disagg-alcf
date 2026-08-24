@@ -11,7 +11,10 @@
 #
 # Extra args pass through to the Python:
 #     bash run_repro_nixl_2rank_transfer.sh --gib 16 --mem cuda
-#     bash run_repro_nixl_2rank_transfer.sh --op READ      # vLLM's direction
+#     bash run_repro_nixl_2rank_transfer.sh --op WRITE     # reproduces BLOCKER 3
+#
+# --op defaults to READ: it is vLLM's direction and the only one this stack
+# supports. See BLOCKER 3 below.
 #
 # WHY ONE mpiexec, NOT ONE PER RANK
 # ---------------------------------
@@ -123,9 +126,22 @@ export LD_PRELOAD="${SCRIPT_DIR}/fi_getinfo_shim.so"
 #         fi_recvmsg
 #     So WRITE is unreachable on this stack, but READ should work.
 #
-# CONSEQUENCE: use --op READ. That is also what the real workload does --
-# vLLM's NixlConnector is a PULL (NixlPullConnectorWorker): decode reads KV
-# from prefill. vLLM never issues the WRITE path at all.
+# MEASURED with READ, 2 nodes x 1 rank, 4 GiB DRAM, 64 x 64 MiB descriptors:
+#   query_xfer_backend -> LIBFABRIC        (Q1: no silent fallback)
+#   destination buffer byte-exact          (Q2: pass)
+#   best 0.049s -> 87.39 GB/s, mean 65.75 GB/s vs a 100 GB/s 4-rail peak
+#   initiator rx 1.02x of payload          (Q3: pass on the initiator)
+#   target    tx 0.77x of payload          (Q3: NOT yet clean on the target)
+# The target shortfall was a sampling artifact, not a transport one -- its
+# four NICs disagreed by ~75 MB in read order while the initiator's agreed to
+# 512 bytes. The Python now settles the telemetry caches before sampling; the
+# target figure above predates that and is expected to move. Do not quote it.
+#
+# CONSEQUENCE: READ is the DEFAULT --op in the Python. That is also what the
+# real workload does -- vLLM's NixlConnector is a PULL
+# (NixlPullConnectorWorker): decode reads KV from prefill, and vLLM never
+# issues the WRITE path at all. `--op WRITE` is still accepted and still
+# fails here, so the blocker stays reproducible on demand.
 export FI_CXI_ENABLE_WRITEDATA="${FI_CXI_ENABLE_WRITEDATA:-1}"
 
 exec python3 "${SCRIPT_DIR}/repro_nixl_2rank_transfer.py" "$@"
