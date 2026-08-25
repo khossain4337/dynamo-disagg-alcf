@@ -127,18 +127,48 @@ if not os.path.isdir(snaps):
     print("  INCOMPLETE: no snapshot directory. Nothing has been downloaded.")
     sys.exit(1)
 
-# Newest revision, in case an earlier one is still lying around.
-rev = max((os.path.join(snaps, d) for d in os.listdir(snaps)), key=os.path.getmtime)
+# Resolve the SAME revision vLLM will load, not merely the newest one on disk.
+# A repo can pick up a new commit between runs, leaving two snapshot
+# directories -- one complete, one a stub. Verifying by mtime and loading by
+# ref would then check one revision and serve another, and the failure would
+# arrive 30 minutes into a Nemotron load looking nothing like "wrong snapshot".
+# refs/main is what huggingface_hub resolves a bare repo-id against, so read it.
+ref = os.path.join(root, "refs", os.environ.get("HF_REVISION", "main"))
+if os.path.exists(ref):
+    with open(ref) as f:
+        rev = os.path.join(snaps, f.read().strip())
+    if not os.path.isdir(rev):
+        print(f"  INCOMPLETE: refs/main names {os.path.basename(rev)},")
+        print("  but no such snapshot directory exists.")
+        sys.exit(1)
+else:
+    # No ref (rare -- a partial or hand-assembled cache). Fall back to newest.
+    rev = max((os.path.join(snaps, d) for d in os.listdir(snaps)),
+              key=os.path.getmtime)
+    print("  (no refs/main; falling back to the newest snapshot on disk)")
+
+stale = [d for d in os.listdir(snaps) if os.path.join(snaps, d) != rev]
+if stale:
+    print(f"  note: {len(stale)} other snapshot(s) present: {', '.join(d[:12] for d in stale)}")
+    print("        harmless -- snapshots hold only symlinks -- but `du` counts them.")
 idx = os.path.join(rev, "model.safetensors.index.json")
 
-if not os.path.exists(idx):
-    print("  INCOMPLETE: model.safetensors.index.json is missing.")
-    print("  The weight manifest itself has not been fetched, so there is")
-    print("  nothing to verify against. Re-run without VERIFY=1 to fetch.")
+if os.path.exists(idx):
+    with open(idx) as f:
+        want = sorted(set(json.load(f)["weight_map"].values()))
+elif os.path.exists(os.path.join(rev, "model.safetensors")):
+    # Unsharded. Models below roughly 5 GB ship one model.safetensors and NO
+    # index, so an index-only check would call every small model INCOMPLETE --
+    # including the Qwen rigs this harness is brought up on. There is no
+    # manifest to compare against in this case, so "the single weight file is
+    # present" is the strongest statement available; say so rather than imply
+    # the same rigour as the sharded path.
+    want = ["model.safetensors"]
+    print("  (unsharded model: no index to verify against, checking the one file)")
+else:
+    print("  INCOMPLETE: neither model.safetensors.index.json nor")
+    print("  model.safetensors is present. No weights have been fetched.")
     sys.exit(1)
-
-with open(idx) as f:
-    want = sorted(set(json.load(f)["weight_map"].values()))
 
 # os.path.exists() follows symlinks, so a snapshot entry pointing at a blob
 # that was never written counts as missing -- which is exactly right here.
@@ -156,7 +186,11 @@ partial = ([f for f in os.listdir(blobs) if f.endswith(".incomplete")]
 
 print(f"  snapshot: {rev}")
 print(f"  shards:   {len(want) - len(missing)} of {len(want)} present")
-print(f"  weights:  {total / 1e9:.1f} GB")
+# Both units, because `du -h` reports GiB and the model card reports GB, and a
+# reader comparing the two otherwise sees a 7% "discrepancy" that is only ever
+# 2^30 vs 10^9. Shards only -- du counts the tokenizer, configs and any stale
+# snapshot as well, so du will always read slightly higher than this line.
+print(f"  weights:  {total / 1e9:.1f} GB  ({total / 2**30:.1f} GiB, shards only)")
 if partial:
     print(f"  in-flight: {len(partial)} .incomplete blob(s) -- download was interrupted")
 if missing:
