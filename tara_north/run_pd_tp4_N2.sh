@@ -788,6 +788,92 @@ echo ""
 # silently). The rail COUNTS are not a verdict. The verdict is the wire half
 # below, where the CXI octet counters say which devices actually moved bytes.
 # =============================================================================
+# =============================================================================
+# Q4 (CPU half) -- is each TP worker running on its own GPU's NUMA domain?
+#
+# Node topology, from `nvidia-smi topo -m` on a Tara compute node (2026-08-25,
+# also captured per-run in provenance.txt):
+#
+#       GPU0  GPU1  GPU2  GPU3   CPU affinity  NUMA  GPU NUMA ID
+#   GPU0   X   NV6   NV6   NV6      0-71         0        4
+#   GPU1  NV6    X   NV6   NV6     72-143        1       12
+#   GPU2  NV6   NV6    X   NV6    144-215        2       20
+#   GPU3  NV6   NV6   NV6    X    216-287        3       28
+#
+# Two things follow. First, NV6 everywhere: all four GPUs are NVLink-connected,
+# six links per pair, so TP=4's all-reduce stays on NVLink and never touches
+# the fabric we are measuring. Second, and the reason this section exists: this
+# is a QUAD-GH200 node, four Grace-Hopper modules, each its own NUMA domain
+# with its own 72 Grace cores and its own PCIe complex. It is not one big CPU
+# with four GPUs hanging off it. GPU i, NUMA i and cxi<i> are the same module.
+#
+# That per-module structure is why Q4 works at all -- groupNicsWithAccel()
+# partitions NICs by PCIe complex, and here there are genuinely four. The table
+# predicts the TP=2 wire result from hardware alone.
+#
+# It also exposes what --cpu-bind cannot fix. mpiexec runs -n 2 -ppn 1: ONE
+# rank per node, which then forks all ${TP} workers itself, so any PALS mask
+# applies to the whole tree. `none` (all 288 cores) is the only setting that
+# does not strangle ${TP} workers into one rank's slice -- see the comment at
+# the mpiexec call. But it is freedom, not placement: nothing then pulls worker
+# i toward NUMA i. vLLM 0.27.1 offers no hook to do it either; the entire CPU
+# story for GPU workers is multiproc_executor.py:1060-1088, which only forces
+# OMP_NUM_THREADS=1. So worker 2's host buffers and libfabric CQ polling can
+# land on NUMA 0 while its GPU and its NIC are on NUMA 2.
+#
+# How much that costs is UNMEASURED, and the honest expectation is: little for
+# Q1-Q4, more for Stage 4. The KV payload is GPU-to-NIC over GPUDirect and
+# never touches host memory; what crosses NUMA is the control path -- 24
+# descriptors and a completion queue -- which is noise against a 5 ms transfer.
+# Under benchmark concurrency, where the scheduler, sampler and detokeniser run
+# hot on every step, it stops being noise.
+#
+# So: report always, pin only on request. PIN_WORKERS=1 tasksets each worker to
+# its module's cores. Note the limit honestly -- taskset moves THREADS, not
+# already-allocated PAGES, and vLLM's large host allocations happen during
+# model load, long before this runs. Expect CPU locality, not memory locality.
+# Getting memory placement right needs numactl around a spawn we do not
+# control. Default 0 so the fabric bring-up runs stay unconfounded.
+CORES_PER_NUMA=${CORES_PER_NUMA:-72}
+PIN_WORKERS=${PIN_WORKERS:-0}
+
+report_worker_affinity() {
+    local role=$1 node=$2
+    echo "  --- ${role} (${node}) ---"
+    # NOT `ssh -n` here, unlike everywhere else in this file: -n points stdin at
+    # /dev/null, which would swallow the heredoc that carries the remote script.
+    ssh "${node}" "TP=${TP} CPN=${CORES_PER_NUMA} PIN=${PIN_WORKERS} bash -s" <<'REMOTE' 2>&1 | sed 's/^/      /'
+for i in $(seq 0 $((TP - 1))); do
+    # Bracketed like every other pattern in this script so pgrep does not match
+    # its own command line. No TP1/TP10 ambiguity at TP<=4.
+    pid=$(pgrep -f "[W]orker_TP${i}" | head -1)
+    if [ -z "${pid}" ]; then
+        echo "TP${i}: no process found"
+        continue
+    fi
+    lo=$(( i * CPN )); hi=$(( lo + CPN - 1 ))
+    if [ "${PIN}" = "1" ]; then
+        if taskset -apc ${lo}-${hi} ${pid} >/dev/null 2>&1; then
+            echo "TP${i}: pinned pid ${pid} -> cores ${lo}-${hi}"
+        else
+            echo "TP${i}: pin FAILED for pid ${pid} (no taskset, or not permitted)"
+        fi
+    fi
+    cpus=$(awk '/^Cpus_allowed_list/{print $2}' /proc/${pid}/status 2>/dev/null)
+    mems=$(awk '/^Mems_allowed_list/{print $2}' /proc/${pid}/status 2>/dev/null)
+    verdict="floating across all NUMA domains"
+    [ "${cpus}" = "${lo}-${hi}" ] && verdict="matches GPU${i}/NUMA${i}"
+    echo "TP${i}: pid ${pid} cpus=${cpus} mems=${mems} -- want ${lo}-${hi} (NUMA ${i}) -- ${verdict}"
+done
+REMOTE
+}
+
+echo "=== Q4 (CPU half): TP worker placement vs the GPU/NUMA partition ==="
+echo "  PIN_WORKERS=${PIN_WORKERS} (1 to taskset each worker to its module's ${CORES_PER_NUMA} cores)"
+report_worker_affinity "prefill" "${NODE_P}"
+report_worker_affinity "decode"  "${NODE_D}"
+echo ""
+
 echo "=== Q4 (log half): NIXL agent construction across the ${TP} TP workers ==="
 for role in p d; do
     log=${SHARED}/logs/${role}.log

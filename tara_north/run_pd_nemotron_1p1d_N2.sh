@@ -1028,43 +1028,129 @@ echo "  server means it came up on UCX, and Q2's counters will be misleading."
 echo ""
 
 # =============================================================================
-# Q4 (log half) -- did all ${TP} workers build a NIXL agent, and how many rails
-# does each of them think it has?
+# Q4 (CPU half) -- is each TP worker running on its own GPU's NUMA domain?
 #
-# libfabric_backend.cpp:456 prints
-#     Rail Manager created with <N> rails
-# once per agent construction, at NIXL_INFO. One agent per TP worker, so:
+# Node topology, from `nvidia-smi topo -m` on a Tara compute node (2026-08-25,
+# also captured per-run in provenance.txt):
 #
-#   ${TP} lines, each "1 rails"   -> healthy. Every worker took its own GPU's
-#                                    NIC. This is the aggregate regime the
-#                                    microbenchmark measured at 87.67 GB/s.
-#   fewer than ${TP} lines        -> some workers never built an agent. Either
-#                                    the shim did not reach them or the backend
-#                                    failed there and fell back silently.
-#   ${TP} lines, all ">1 rails"   -> topology grouping fell back to
-#                                    "all accelerators use all devices"
-#                                    (libfabric_topology.cpp:698). Not fatal,
-#                                    but it means four workers are contending
-#                                    for the same four NICs instead of owning
-#                                    one each.
+#       GPU0  GPU1  GPU2  GPU3   CPU affinity  NUMA  GPU NUMA ID
+#   GPU0   X   NV6   NV6   NV6      0-71         0        4
+#   GPU1  NV6    X   NV6   NV6     72-143        1       12
+#   GPU2  NV6   NV6    X   NV6    144-215        2       20
+#   GPU3  NV6   NV6   NV6    X    216-287        3       28
 #
-# This is the LOG half and it is only half. A worker can report "1 rails" and
-# still have picked the same NIC as its three siblings -- the count says how
-# many it holds, not which. The wire half is Q4 below, after the transfer,
-# where the CXI counters say which devices actually moved bytes.
+# NV6 everywhere: all four GPUs are NVLink-connected, six links per pair. TP=4's
+# all-reduce therefore stays on NVLink and never competes with the KV transfer
+# for the fabric. That is one of the reasons TP=4 is the right choice here and
+# not merely the forced one (the other being Mamba's lack of a heterogeneous-TP
+# path -- see the LOCKED block at the top).
+#
+# The rest of the table says this is a QUAD-GH200 node: four Grace-Hopper
+# modules, each its own NUMA domain with its own 72 Grace cores and its own
+# PCIe complex. Not one big CPU with four GPUs attached. GPU i, NUMA i and
+# cxi<i> are the same module -- which is why groupNicsWithAccel() finds four
+# distinct complexes to partition, and why Q4's fan-out works.
+#
+# What --cpu-bind cannot fix: mpiexec runs -n 2 -ppn 1, ONE rank per node, and
+# that rank forks all ${TP} workers itself, so any PALS mask hits the whole
+# tree. `none` (all 288 cores) is the only setting that does not strangle
+# ${TP} workers into one rank's slice. But it grants freedom, not placement --
+# nothing pulls worker i toward NUMA i, and vLLM 0.27.1 has no hook to do it:
+# the entire CPU story for GPU workers is multiproc_executor.py:1060-1088,
+# which only forces OMP_NUM_THREADS=1.
+#
+# Cost is UNMEASURED. Expect little for Q1-Q4 -- the KV payload goes GPU-to-NIC
+# over GPUDirect and never touches host memory, so what crosses NUMA is the
+# control path against a multi-millisecond transfer. Expect more once this
+# model is under benchmark concurrency, where the scheduler, sampler and
+# detokeniser run hot every step. Nemotron adds a reason the Qwen rig did not
+# have: the Mamba state is large and constant per sequence, so D's host-side
+# bookkeeping per request is heavier.
+#
+# Report always, pin only on request. PIN_WORKERS=1 tasksets each worker to its
+# module's cores. The honest limit: taskset moves THREADS, not already-
+# allocated PAGES, and vLLM's large host allocations happen during model load,
+# long before this runs -- so expect CPU locality, not memory locality. Real
+# memory placement needs numactl around a spawn we do not control. Default 0 so
+# bring-up runs stay unconfounded; turn it on for the Stage 4 sweep and compare.
+CORES_PER_NUMA=${CORES_PER_NUMA:-72}
+PIN_WORKERS=${PIN_WORKERS:-0}
+
+report_worker_affinity() {
+    local role=$1 node=$2
+    echo "  --- ${role} (${node}) ---"
+    # NOT `ssh -n` here, unlike everywhere else in this file: -n points stdin at
+    # /dev/null, which would swallow the heredoc that carries the remote script.
+    ssh "${node}" "TP=${TP} CPN=${CORES_PER_NUMA} PIN=${PIN_WORKERS} bash -s" <<'REMOTE' 2>&1 | sed 's/^/      /'
+for i in $(seq 0 $((TP - 1))); do
+    # Bracketed like every other pattern in this script so pgrep does not match
+    # its own command line. No TP1/TP10 ambiguity at TP<=4.
+    pid=$(pgrep -f "[W]orker_TP${i}" | head -1)
+    if [ -z "${pid}" ]; then
+        echo "TP${i}: no process found"
+        continue
+    fi
+    lo=$(( i * CPN )); hi=$(( lo + CPN - 1 ))
+    if [ "${PIN}" = "1" ]; then
+        if taskset -apc ${lo}-${hi} ${pid} >/dev/null 2>&1; then
+            echo "TP${i}: pinned pid ${pid} -> cores ${lo}-${hi}"
+        else
+            echo "TP${i}: pin FAILED for pid ${pid} (no taskset, or not permitted)"
+        fi
+    fi
+    cpus=$(awk '/^Cpus_allowed_list/{print $2}' /proc/${pid}/status 2>/dev/null)
+    mems=$(awk '/^Mems_allowed_list/{print $2}' /proc/${pid}/status 2>/dev/null)
+    verdict="floating across all NUMA domains"
+    [ "${cpus}" = "${lo}-${hi}" ] && verdict="matches GPU${i}/NUMA${i}"
+    echo "TP${i}: pid ${pid} cpus=${cpus} mems=${mems} -- want ${lo}-${hi} (NUMA ${i}) -- ${verdict}"
+done
+REMOTE
+}
+
+echo "=== Q4 (CPU half): TP worker placement vs the GPU/NUMA partition ==="
+echo "  PIN_WORKERS=${PIN_WORKERS} (1 to taskset each worker to its module's ${CORES_PER_NUMA} cores)"
+report_worker_affinity "prefill" "${NODE_P}"
+report_worker_affinity "decode"  "${NODE_D}"
+echo ""
+
 # =============================================================================
-echo "=== Q4 (log half): rail fan-out across the ${TP} TP workers ==="
+# Q4 (log half) -- did all ${TP} workers build a NIXL agent?
+#
+# Corrected 2026-08-25 against the TP=2 Qwen run. Two NIXL lines mention rails
+# and they count DIFFERENT things:
+#
+#   libfabric_backend.cpp:456  "Rail Manager created with <N> rails"
+#       Per agent construction. N is how many rails that agent HOLDS.
+#   libfabric_backend.cpp:782  "Successfully created connection for agent
+#                               <id> on <N> rails"
+#       Per peer connection. N counts every NIC on the node, so on Tara it
+#       reads "on 4 rails" regardless of TP. NOT a fan-out measurement.
+#
+# The TP=2 run printed "on 4 rails" while the wire showed each worker on
+# exactly ONE device (cxi0 tx=31.5 MB, cxi1 tx=31.3 MB, cxi2=572 B, cxi3=0).
+# Two workers striping over four rails would have shown four devices at ~15 MB
+# each. So the connection spans all four NICs but rail SELECTION is by GPU
+# affinity, one rail per worker.
+#
+# This section is therefore advisory. Agent count is all it establishes: fewer
+# than ${TP} rail managers => some workers never built an agent. The rail
+# COUNTS are not a verdict; the wire half below is.
+# =============================================================================
+echo "=== Q4 (log half): NIXL agent construction across the ${TP} TP workers ==="
 for role in p d; do
     log=${SHARED}/logs/${role}.log
     n_rm=$(grep -c 'Rail Manager created with' "${log}" 2>/dev/null || true)
     echo "  --- ${role}: ${n_rm} rail managers, expected ${TP} (one per TP worker) ---"
     if [ "${n_rm}" -eq 0 ] 2>/dev/null; then
-        echo "      No rail-manager lines at all. Either NIXL_LOG_LEVEL is not INFO,"
-        echo "      or the LIBFABRIC backend never came up -- see Q3 above."
+        echo "      No rail-manager lines. This string is not emitted by every NIXL"
+        echo "      build at INFO -- absence is not by itself a failure. Fall back to"
+        echo "      the connection lines below and to Q3's shim-announcement count."
     else
         grep -o 'Rail Manager created with [0-9]* rails' "${log}" 2>/dev/null \
             | sort | uniq -c | sed 's/^/      /'
     fi
+    n_conn=$(grep -c 'Successfully created connection for agent' "${log}" 2>/dev/null || true)
+    echo "      ${n_conn} peer connections established (spans all node NICs; not a fan-out signal)"
     # The accelerator->NIC map, printed at INFO by libfabric_topology.cpp:285.
     # Every agent prints the whole node's map, so these repeat ${TP} times;
     # dedupe. This is what a healthy 4-GPU/4-NIC partition looks like -- four
