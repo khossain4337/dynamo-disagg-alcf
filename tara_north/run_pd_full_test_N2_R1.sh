@@ -2,29 +2,66 @@
 set -uo pipefail
 
 # =============================================================================
-# 1P1D NIXL cross-node smoke test (PBS)
+# 1P1D NIXL cross-node smoke test (PBS) -- LIBFABRIC/CXI edition
 #
 # Verifies three separate, chained questions:
 #   Q1  Did a KV-cache transfer actually happen (vs D silently doing its own
-#       local prefill)?              -> timing comparison, baseline vs disagg
-#   Q2  Did it go over hsn0, not bond0 (mgmt net)?
-#                                     -> /proc/net/dev byte counters, before/after
-#   Q3  Did it use Slingshot properly (UCX/CXI), not a TCP fallback?
-#                                     -> optional UCX_DEBUG=1 diagnostic pass
+#       local prefill)?              -> /metrics diff on P and D, plus timing
+#   Q2  Did the bytes actually cross Slingshot?
+#                                     -> CXI hardware octet counters, sampled
+#   Q3  Did it use the LIBFABRIC backend with the shim, not a fallback?
+#                                     -> shim PATCH lines + rail-manager lines
 #
-# Q2/Q3 only mean something once Q1 has passed. A TCP fallback over hsn0
-# would still pass Q2 and still complete Q1's timing test with SOME
-# improvement -- Q3 is the only thing that catches that specific failure mode.
+# Q2/Q3 only mean something once Q1 has passed.
 #
 # Usage:
-#   Normal run:        bash pd_nixl_multinode_smoke.sh
-#   Transport-debug:   UCX_DEBUG=1 bash pd_nixl_multinode_smoke.sh
-#     (UCX_DEBUG adds UCX_LOG_LEVEL=debug and skips the timing/counter checks
-#      -- it's noisy and meant as a one-off pass to answer Q3, not a
-#      combined run. Do the normal run first.)
+#   bash run_pd_full_test_N2_R1.sh
+#   NIXL_BACKEND=UCX bash run_pd_full_test_N2_R1.sh      # explicit A/B
+#   PROMPT_REPEAT=2000 bash run_pd_full_test_N2_R1.sh    # bigger KV payload
+#
+# -----------------------------------------------------------------------------
+# WHY ONE mpiexec AND NOT TWO ssh -- the thing that makes this file different
+# from every earlier revision.
+#
+# CXI needs a VNI. Without one, fi_domain() returns -FI_ENOSYS and the
+# LIBFABRIC backend never comes up. The VNI arrives only in SLINGSHOT_VNIS,
+# provisioned by PALS. Two `ssh -n NODE "bash launch_x.sh"` calls -- what this
+# script used to do -- carry NO PALS environment at all, so both servers die
+# at backend creation.
+#
+# The obvious repair (wrap each side in its own `mpiexec -n 1
+# --single-node-vni`) is WORSE, and this is measured, not theorised. PALS
+# allocates a VNI per APPLICATION, and a VNI is a traffic-isolation domain:
+# endpoints on different VNIs cannot reach each other at all. Three separate
+# launches were observed getting three different VNIs (1726, 1825, 1873 --
+# the last from `-n 1 --single-node-vni`). Two independent launches would each
+# build their agent happily and then never connect, trading today's loud
+# immediate ENOSYS for a silent hang. See run_repro_nixl_2rank_transfer.sh:62.
+#
+# So: ONE `mpiexec -n 2 -ppn 1` runs ONE role script on both nodes, and that
+# script picks prefill-vs-decode by HOSTNAME. Pairing by hostname rather than
+# by PMI_RANK means whatever rank order PALS happens to hand out is
+# irrelevant -- the same trick repro_nixl_2rank_transfer.py already uses.
+#
+# The proxy and this driver script stay OUTSIDE the mpiexec. They are plain
+# HTTP and touch no fabric, so they need no VNI.
+#
+# -----------------------------------------------------------------------------
+# WHY Q1 IS NO LONGER A TIMING TEST
+#
+# Earlier revisions asserted "disagg time_starttransfer should be noticeably
+# LOWER than baseline". That is wrong, and it would report a HEALTHY run as a
+# failure. Baseline is prefill-on-D. Disagg is prefill-on-P plus a KV transfer
+# plus a proxy hop -- the same prefill work, with strictly more overhead
+# around it. For a single request, correct 1P1D is EXPECTED TO BE SLOWER.
+# Disaggregation buys throughput and ITL under load, not single-shot TTFT.
+#
+# The discriminating evidence is whether D skipped prefill. That is read off a
+# before/after diff of both servers' /metrics endpoints, which is
+# self-describing -- we print every counter that moved rather than guessing
+# metric names that shift between vLLM releases. Timing is kept, demoted to a
+# sanity check.
 # =============================================================================
-
-UCX_DEBUG=${UCX_DEBUG:-0}
 # CONFIRMED via check_cxi_libfabric.sh probe (both nodes, 2026-08-19): fi_info -p cxi
 # works, libfabric 2.3.1, and NIXL's plugin manager lists LIBFABRIC as loadable in
 # this exact conda env. Defaulting to it -- NIXL's own default backend is UCX, and
@@ -39,6 +76,22 @@ P_PORT=8100; D_PORT=8200; PROXY_PORT=8000
 # Override with PROXY_SCRIPT=/your/path if your checkout lives elsewhere or
 # a newer vllm version moves this file.
 PROXY_SCRIPT=${PROXY_SCRIPT:-/vast/draco/tara/projects/Tara_Deployment/software/testing/vllm_0.27.1_08_18_2026/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# KV payload size. Qwen2.5-0.5B-Instruct: 24 layers x 2 KV heads x 64 head_dim
+# x 2 (K and V) x 2 bytes fp16 = 12,288 bytes PER TOKEN. The old 6-token
+# prompt therefore moved ~74 KB, which is invisible against background traffic
+# in the CXI octet counters -- Q2 could not have produced a real signal at that
+# size regardless of anything else. 500 repeats of a 9-word sentence is roughly
+# 5k tokens ~= 60 MB, which is unambiguous. Raise PROMPT_REPEAT for a bigger
+# payload; Qwen2.5's 32k context is the ceiling.
+PROMPT_REPEAT=${PROMPT_REPEAT:-500}
+
+# Wall-clock budget for a server to come up. Deliberately generous: on aarch64
+# several of vLLM's CUDA extensions have no prebuilt wheel and JIT-compile on
+# first use, which is minutes, not seconds. Only slow on a cold cache.
+HEALTH_TRIES=${HEALTH_TRIES:-120}     # x5s = 10 min
 
 # --- Resolve the two allocated nodes -----------------------------------------
 cat ${PBS_NODEFILE}
@@ -75,13 +128,47 @@ fi
 # --- Confirm shared FS is actually visible on the remote node ---------------
 ssh -n "${NODE_D}" "test -d ${SHARED}" || { echo "SHARED path not visible on ${NODE_D} -- is /vast/draco mounted there?"; exit 1; }
 
+# --- Stage the shim and the env script into SHARED ---------------------------
+# Copied rather than referenced in place, for three reasons: both nodes are
+# then guaranteed to see byte-identical files regardless of where this repo
+# is checked out; the run becomes self-describing after the fact (the SHARED
+# dir records exactly which shim it used); and nothing depends on the repo
+# itself living on a filesystem both compute nodes mount.
+for f in fi_getinfo_shim.so env_for_libfabric_topology_error.sh; do
+    if [ ! -f "${SCRIPT_DIR}/${f}" ]; then
+        echo "Missing ${SCRIPT_DIR}/${f} -- cannot continue."
+        [ "${f}" = "fi_getinfo_shim.so" ] && echo "  Build it: gcc -shared -fPIC -o fi_getinfo_shim.so fi_getinfo_shim.c -ldl \$(pkg-config --cflags libfabric)"
+        exit 1
+    fi
+    cp "${SCRIPT_DIR}/${f}" "${SHARED}/${f}"
+done
+SHIM="${SHARED}/fi_getinfo_shim.so"
+
+# The tracked .so has gone stale before -- committed carrying PATCH 1 only
+# while the .c had already grown PATCHES 2-4. That build clears BLOCKER 1
+# (mr_mode==0 -> -FI_ENODATA) and then dies later in registerMem with "no
+# available backends for mem type 'VRAM_SEG'", which reads as "the shim is
+# broken" rather than "the shim is old". Cheap to rule out up front.
+N_PATCH=$(strings "${SHIM}" 2>/dev/null | grep -c 'PATCH [234]' || true)
+if [ "${N_PATCH}" -eq 0 ]; then
+    echo "*** STALE SHIM: ${SCRIPT_DIR}/fi_getinfo_shim.so has no PATCH 2/3/4 markers. ***"
+    echo "*** It carries BLOCKER 1 only; --mem cuda / VRAM registration will fail.  ***"
+    echo "*** Rebuild on this node before running:                                  ***"
+    echo "***   gcc -shared -fPIC -o fi_getinfo_shim.so fi_getinfo_shim.c -ldl \$(pkg-config --cflags libfabric)"
+    exit 1
+fi
+echo "Shim staged: ${SHIM} (PATCH 2/3/4 markers present)"
+
 NO_PROXY_LIST="localhost,127.0.0.1,${P_IP},${D_IP},${NODE_P},${NODE_D}"
 
 # --- Common env, sourced by both role scripts --------------------------------
-UCX_LOG_LINE=""
-if [ "${UCX_DEBUG}" = "1" ]; then
-    UCX_LOG_LINE="export UCX_LOG_LEVEL=debug"
-    echo "*** UCX_DEBUG=1: transport-negotiation diagnostic mode. Logs will be large. ***"
+# UCX-only tunables are gated on NIXL_BACKEND so the A/B still works, but they
+# are dead weight on the LIBFABRIC path and were previously set unconditionally
+# -- which made LIBFABRIC runs look UCX-configured in the logs.
+UCX_LINES=""
+if [ "${NIXL_BACKEND}" = "UCX" ]; then
+    UCX_LINES='export UCX_TLS=cuda_copy,cuda_ipc,sm,tcp,self
+export UCX_MODULE_DIR=$(python3 -c "import site,glob; print(glob.glob(site.getsitepackages()[0]+'"'"'/nixl_cu13.libs/ucx'"'"')[0])")'
 fi
 
 # GPU_ID intentionally NOT set by default -- CUDA_VISIBLE_DEVICES is left
@@ -90,13 +177,17 @@ fi
 #   1. Hardcoding to GPU 0 is exactly the kind of thing that silently breaks
 #      once this script grows into the real sweep (Section 6) and needs a
 #      specific GPU per role on a multi-GPU node -- easy to forget it's there.
-#   2. Logical inference, NOT confirmed against NIXL's source: the LIBFABRIC
-#      backend does topology-aware GPU-to-NIC rail selection (NUMA-aware,
-#      PCI-bus-ID-based, per NIXL's own release notes). Restricting GPU
-#      visibility to one device could hand that logic a degenerate view of
-#      the node's topology. Leaving all GPUs visible avoids the risk for free
-#      -- vLLM still defaults to tensor-parallel-size=1 and lands on the
-#      first visible device, so this smoke test's behavior is unchanged.
+#   2. Was: "logical inference, NOT confirmed" that restricting GPU visibility
+#      could hand NIXL's rail selection a degenerate view of the topology.
+#      NOW MEASURED, and the concern does not apply: the LIBFABRIC backend
+#      reads its topology from hwloc (the whole node, always) and resolves
+#      rails from the GPU's real PCI bus id, which CUDA_VISIBLE_DEVICES does
+#      not change. Pinning one GPU gets you that GPU's one rail -- which is
+#      the correct and expected 1-rail/25 GB/s behaviour for a TP=1 worker,
+#      not a degraded topology. (The separate experiment that DID try to
+#      widen a single GPU's rail count, by pruning the hwloc XML, is
+#      --mode solo-peak in the benchmark, and it is a documented negative:
+#      the NIC split is per PCIe complex, so pruning cannot help.)
 # To pin a specific GPU for a future run, set GPU_ID rather than editing this
 # file, e.g.: GPU_ID=2 bash run_pd_full_test_N2_R1.sh
 GPU_PIN_LINE=""
@@ -113,8 +204,17 @@ export https_proxy=http://proxy.alcf.anl.gov:3128
 export NO_PROXY=${NO_PROXY_LIST}
 export no_proxy=${NO_PROXY_LIST}
 
-source /vast/draco/tara/projects/Tara_Deployment/software/miniforge3/bin/activate
-conda activate /vast/draco/tara/projects/Tara_Deployment/software/envs/conda_envs/vllm_0.27.1_nixl_1.4.0_python_3.12.12
+# Conda activation and the NVHPC CUDA_HOME fixup both come from the staged
+# copy of env_for_libfabric_topology_error.sh -- the SAME file the working
+# NIXL benchmark sources. Previously this script carried its own inline
+# duplicate of that logic, which is exactly how the two drift apart and how a
+# run that "uses the same environment" quietly stops doing so.
+#
+# set +u across the source for the same reason the benchmark does it: conda's
+# activation machinery reads unset variables, which is fatal under nounset.
+set +u
+source ${SHARED}/env_for_libfabric_topology_error.sh
+set -u
 
 export HF_TOKEN=\$(cat ~/.hf_token)
 export PYTHONNOUSERSITE=1
@@ -124,111 +224,43 @@ export HF_MODULES_CACHE=\${HF_HOME}
 export RAY_TMPDIR=/tmp
 export TMPDIR=/tmp
 export VLLM_LOGGING_LEVEL=DEBUG
-export UCX_TLS=cuda_copy,cuda_ipc,sm,tcp,self
-export UCX_MODULE_DIR=\$(python3 -c "import site,glob; print(glob.glob(site.getsitepackages()[0]+'/nixl_cu13.libs/ucx')[0])")
+${UCX_LINES}
 ${GPU_PIN_LINE}
-${UCX_LOG_LINE}
 EOF
 
-# Appended with a QUOTED heredoc delimiter ('EOF') so `which nvc++` is
+# Appended with a QUOTED heredoc delimiter ('EOF') so the paths below are
 # resolved when common_env.sh actually RUNS on the compute node, not now on
 # whichever node this launcher script happens to be running on -- login and
 # compute node module environments aren't guaranteed to match on Cray systems.
+#
+# Everything the old inline block did -- CC/CXX/CUDAHOSTCXX=nvc++, CUDA_HOME,
+# LIBRARY_PATH, LD_LIBRARY_PATH, CPATH and the math_libs LIB dir -- now comes
+# from env_for_libfabric_topology_error.sh, sourced above. This appendix keeps
+# the ONE thing that file does not do.
 cat >> ${SHARED}/common_env.sh <<'EOF'
 
-# GH200 is aarch64; several CUDA/C++ extensions vLLM ships prebuilt for
-# x86_64 don't have aarch64 wheels, so they JIT-compile via nvcc on first
-# run. CONFIRMED from an actual crash log (not guessed): the JIT build path
-# feeds nvcc's -ccbin from $CC, not $CXX. On this system CC=nvc (the NVHPC C
-# compiler), and nvcc rejects any NVHPC-family compiler except nvc++:
-#   "nvcc fatal: Unsupported NVHPC compiler found. nvc++ is the only
-#    NVHPC compiler that is supported."
-# Fix: point CC at nvc++ too (yes, both CC and CXX -- verified against an
-# actual failing -ccbin invocation, not assumed from convention).
-# If this clears THIS error but produces a *different* compile failure
-# inside FlashInfer's sources, nvc++ itself may not be a reliable nvcc host
-# compiler on this NVHPC version -- check `which gcc g++` and switch both
-# CC and CXX to those instead, matching the GNU ABI the rest of this env's
-# wheels were almost certainly built against.
-NVCXX=$(which nvc++ 2>/dev/null || true)
-if [ -n "${NVCXX}" ]; then
-    export CC="${NVCXX}"
-    export CXX="${NVCXX}"
-    export CUDAHOSTCXX="${NVCXX}"
-else
-    echo "WARNING: nvc++ not found on PATH on $(hostname -s)." >&2
-    echo "If a JIT compile step fails with an NVHPC host-compiler error," >&2
-    echo "run 'module avail nvhpc' on this node and load the right module" >&2
-    echo "before this script's launch_{p,d}.sh runs." >&2
-fi
-
-# CONFIRMED from an actual failing link command: torch's CUDA_HOME
-# auto-detection derives from nvcc's location (dirname(dirname($(which
-# nvcc)))), which lands in NVHPC's *compiler-only* tree
-# (.../<ver>/compilers). NVHPC SDK layouts keep the real CUDA toolkit
-# (libcudart.so etc.) in a SIBLING directory, .../<ver>/cuda/<cuda-ver>/ --
-# so the auto-detected path is structurally wrong, not just misconfigured.
-# This block finds the real one and points CUDA_HOME/LIBRARY_PATH/
-# LD_LIBRARY_PATH at it explicitly, rather than trusting auto-detection.
-if [ -n "${NVCXX}" ]; then
-    NVHPC_COMPILERS_DIR=$(dirname "$(dirname "${NVCXX}")")   # .../<ver>/compilers
-    NVHPC_VER_ROOT=$(dirname "${NVHPC_COMPILERS_DIR}")        # .../<ver>
-    # Deliberately searches .../<ver>/cuda, NOT .../<ver>/REDIST/cuda --
-    # REDIST is NVHPC's copy for bundling into containers/distributions,
-    # not the one meant to be built against.
-    CUDA_VER_DIR=$(find "${NVHPC_VER_ROOT}/cuda" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1)
-    # NVHPC/CUDA's multi-target layout nests the actual lib dir under
-    # <cuda_ver_dir>/targets/<arch>-linux/lib/, not a flat lib64/ --
-    # confirmed via `find` on this system (aarch64 -> sbsa-linux) rather
-    # than assumed, since the exact "targets/<arch>" segment varies by
-    # platform and shouldn't be hardcoded.
-    REAL_CUDA_LIB_DIR=""
-    if [ -n "${CUDA_VER_DIR}" ]; then
-        REAL_CUDA_LIB_DIR=$(find "${CUDA_VER_DIR}" -name "libcudart.so" -printf '%h\n' 2>/dev/null | head -1)
-    fi
-    if [ -n "${REAL_CUDA_LIB_DIR}" ]; then
-        export CUDA_HOME="${CUDA_VER_DIR}"
-        export LIBRARY_PATH="${REAL_CUDA_LIB_DIR}:${LIBRARY_PATH:-}"
-        export LD_LIBRARY_PATH="${REAL_CUDA_LIB_DIR}:${LD_LIBRARY_PATH:-}"
-        # Same nesting problem as the lib dir, one level up: NVHPC's
-        # multi-target layout keeps the COMPLETE header set as a sibling
-        # of the lib dir (targets/<arch>/include), not under the
-        # version-root's own include/. Confirmed via an actual
-        # "curandStatePhilox4_32_10_t undefined" failure -- curand_kernel.h
-        # wasn't reachable from the flat include dir. Fixed generally via
-        # CPATH rather than one missing header at a time, since other CUDA
-        # math-library headers (cublas, cusparse, etc.) likely have the
-        # identical nesting problem waiting on whatever kernel needs them
-        # next.
-        TARGET_ROOT=$(dirname "${REAL_CUDA_LIB_DIR}")   # .../cuda/<ver>/targets/<arch>
-        if [ -d "${TARGET_ROOT}/include" ]; then
-            export CPATH="${TARGET_ROOT}/include:${CPATH:-}"
-        fi
-        # CONFIRMED (not guessed): curand_kernel.h -- and by strong
-        # implication the rest of the CUDA math libraries (cublas,
-        # cusparse, cusolver, cufft) -- live in a SEPARATE sibling tree,
-        # math_libs/<ver>/, not inside cuda/<ver>/ at all. Reuses the
-        # version string and arch name already confirmed for the cuda/
-        # tree rather than a second blind search, since NVHPC names both
-        # trees the same way.
-        CUDA_VER=$(basename "${CUDA_VER_DIR}")            # e.g. 13.0
-        ARCH_NAME=$(basename "${TARGET_ROOT}")             # e.g. sbsa-linux
-        MATH_LIBS_TARGET="${NVHPC_VER_ROOT}/math_libs/${CUDA_VER}/targets/${ARCH_NAME}"
-        if [ -d "${MATH_LIBS_TARGET}/include" ]; then
-            export CPATH="${MATH_LIBS_TARGET}/include:${CPATH:-}"
+# CONFIRMED (not guessed) from an actual "curandStatePhilox4_32_10_t
+# undefined" failure: the CUDA math-library HEADERS -- curand, and by strong
+# implication cublas/cusparse/cusolver/cufft -- live in a SEPARATE sibling
+# tree, math_libs/<ver>/targets/<arch>/include, not inside cuda/<ver>/ at all.
+# env_for_libfabric_topology_error.sh puts the math_libs LIB dir on
+# LIBRARY_PATH/LD_LIBRARY_PATH but never adds its INCLUDE dir to CPATH, so a
+# JIT compile that needs curand_kernel.h still fails without this block.
+#
+# Derived from CUDA_HOME (which that file exports) rather than from its
+# internal shell variables, so this stays correct if it is ever refactored.
+if [ -n "${CUDA_HOME:-}" ]; then
+    _REAL_CUDA_LIB_DIR=$(find "${CUDA_HOME}" -name "libcudart.so" -printf '%h\n' 2>/dev/null | head -1)
+    if [ -n "${_REAL_CUDA_LIB_DIR}" ]; then
+        _TARGET_ROOT=$(dirname "${_REAL_CUDA_LIB_DIR}")           # .../targets/<arch>
+        _NVHPC_VER_ROOT=$(dirname "$(dirname "${CUDA_HOME}")")    # .../<ver>
+        _MATH_INC="${_NVHPC_VER_ROOT}/math_libs/$(basename "${CUDA_HOME}")/targets/$(basename "${_TARGET_ROOT}")/include"
+        if [ -d "${_MATH_INC}" ]; then
+            export CPATH="${_MATH_INC}:${CPATH:-}"
         else
-            echo "WARNING: expected math_libs include dir not found at ${MATH_LIBS_TARGET}/include" >&2
+            echo "WARNING: math_libs include dir not found at ${_MATH_INC}" >&2
+            echo "         A JIT build needing curand_kernel.h will fail." >&2
         fi
-        if [ -d "${MATH_LIBS_TARGET}/lib" ]; then
-            export LIBRARY_PATH="${MATH_LIBS_TARGET}/lib:${LIBRARY_PATH}"
-            export LD_LIBRARY_PATH="${MATH_LIBS_TARGET}/lib:${LD_LIBRARY_PATH}"
-        else
-            echo "WARNING: expected math_libs lib dir not found at ${MATH_LIBS_TARGET}/lib" >&2
-        fi
-    else
-        echo "WARNING: couldn't find libcudart.so under ${NVHPC_VER_ROOT}/cuda" >&2
-        echo "-lcudart link failures are likely. Check manually:" >&2
-        echo "  find ${NVHPC_VER_ROOT}/cuda -name 'libcudart.so*'" >&2
     fi
 fi
 EOF
@@ -245,44 +277,85 @@ EOF
 KV_XFER_CONFIG_P="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"backends\":[\"${NIXL_BACKEND}\"]}}"
 KV_XFER_CONFIG_D="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"backends\":[\"${NIXL_BACKEND}\"]}}"
 
-cat > ${SHARED}/launch_p.sh <<EOF
+# ONE role script for both nodes, selecting by hostname. See the VNI section
+# in the header for why this cannot be two independent launches.
+#
+# LD_PRELOAD is set HERE and not in common_env.sh on purpose. common_env.sh is
+# also sourced by launch_proxy.sh, and the shim has no business interposing
+# fi_getinfo for a plain HTTP process. Setting it immediately before the exec
+# also keeps it out of every helper command in this shell.
+#
+# It does need to survive into vLLM's children -- EngineCore is a separate
+# process -- but LD_PRELOAD is a normal environment variable and is inherited
+# across fork/exec, so no special handling is required. The shim announces
+# itself on stderr, so `grep fi_getinfo_shim` on the log is free confirmation
+# rather than an assumption; Q3 below does exactly that.
+cat > ${SHARED}/launch_role.sh <<EOF
 #!/bin/bash
 source ${SHARED}/common_env.sh
-export VLLM_NIXL_SIDE_CHANNEL_HOST=${P_IP}
-export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
-vllm serve ${MODEL} --host 0.0.0.0 --port ${P_PORT} \\
-    --gpu-memory-utilization 0.3 \\
-    --no-enable-prefix-caching \\
-    --kv-transfer-config '${KV_XFER_CONFIG_P}'
-EOF
 
-cat > ${SHARED}/launch_d.sh <<EOF
-#!/bin/bash
-source ${SHARED}/common_env.sh
-export VLLM_NIXL_SIDE_CHANNEL_HOST=${D_IP}
-export VLLM_NIXL_SIDE_CHANNEL_PORT=5601
-vllm serve ${MODEL} --host 0.0.0.0 --port ${D_PORT} \\
+if [ "\$(hostname -s)" = "${NODE_P}" ]; then
+    ROLE=p
+    LOG=${SHARED}/logs/p.log
+    PORT=${P_PORT}
+    SIDE_HOST=${P_IP}
+    SIDE_PORT=5600
+    KV_CFG='${KV_XFER_CONFIG_P}'
+elif [ "\$(hostname -s)" = "${NODE_D}" ]; then
+    ROLE=d
+    LOG=${SHARED}/logs/d.log
+    PORT=${D_PORT}
+    SIDE_HOST=${D_IP}
+    SIDE_PORT=5601
+    KV_CFG='${KV_XFER_CONFIG_D}'
+else
+    echo "Rank landed on unexpected host \$(hostname -s); expected ${NODE_P} or ${NODE_D}." >&2
+    exit 1
+fi
+
+exec > "\${LOG}" 2>&1
+echo "=== role=\${ROLE} host=\$(hostname -s) SLINGSHOT_VNIS=\${SLINGSHOT_VNIS:-<UNSET>} ==="
+if [ -z "\${SLINGSHOT_VNIS:-}" ]; then
+    echo "SLINGSHOT_VNIS is EMPTY. The cxi provider will fail fi_domain() with"
+    echo "-FI_ENOSYS and the LIBFABRIC backend will not come up. This means the"
+    echo "process was not launched under PALS -- check the mpiexec invocation."
+fi
+
+export VLLM_NIXL_SIDE_CHANNEL_HOST=\${SIDE_HOST}
+export VLLM_NIXL_SIDE_CHANNEL_PORT=\${SIDE_PORT}
+export NIXL_LOG_LEVEL=\${NIXL_LOG_LEVEL:-INFO}
+export LD_PRELOAD=${SHIM}
+
+exec vllm serve ${MODEL} --host 0.0.0.0 --port \${PORT} \\
     --gpu-memory-utilization 0.3 \\
     --no-enable-prefix-caching \\
-    --kv-transfer-config '${KV_XFER_CONFIG_D}'
+    --kv-transfer-config "\${KV_CFG}"
 EOF
 echo "NIXL backend for this run: ${NIXL_BACKEND}"
 
-# --- Launch both -------------------------------------------------------------
-ssh -n "${NODE_P}" "bash ${SHARED}/launch_p.sh" > ${SHARED}/logs/p.log 2>&1 &
-P_SSH_PID=$!
-ssh -n "${NODE_D}" "bash ${SHARED}/launch_d.sh" > ${SHARED}/logs/d.log 2>&1 &
-D_SSH_PID=$!
+# --- Launch both, from ONE application so they share a VNI -------------------
+# -ppn 1 with 2 nodes puts exactly one server on each. Rank-to-node assignment
+# is PALS's business; the role script sorts itself out by hostname.
+#
+# The logs are opened by the role script itself rather than redirected here,
+# because one mpiexec has one stdout and both servers would otherwise
+# interleave into a single unsplittable stream.
+touch ${SHARED}/logs/p.log ${SHARED}/logs/d.log   # avoid a race with the tails below
+mpiexec -n 2 -ppn 1 bash ${SHARED}/launch_role.sh > ${SHARED}/logs/mpiexec.log 2>&1 &
+MPIEXEC_PID=$!
 
 # Stream both server logs live, prefixed by role so interleaved output stays
 # readable. `sed -u` (unbuffered) matters here -- without it, output piped
 # through sed gets block-buffered and shows up in silent bursts instead of
 # line-by-line, which looks exactly like "nothing is happening" even when it is.
-touch ${SHARED}/logs/p.log ${SHARED}/logs/d.log   # avoid a race if tail starts before ssh creates the file
 tail -n +1 -f ${SHARED}/logs/p.log | sed -u 's/^/[P] /' &
 TAIL_P_PID=$!
 tail -n +1 -f ${SHARED}/logs/d.log | sed -u 's/^/[D] /' &
 TAIL_D_PID=$!
+# mpiexec's own stream carries PALS errors that never reach either role log --
+# a launch that dies before the role script runs is otherwise completely silent.
+tail -n +1 -f ${SHARED}/logs/mpiexec.log | sed -u 's/^/[MPI] /' &
+TAIL_M_PID=$!
 
 cleanup() {
     echo "=== Cleaning up ==="
@@ -292,12 +365,12 @@ cleanup() {
     # the poll never started (POLL_STOP_MARKER unset under `set -u` is guarded
     # with :-).
     touch "${POLL_STOP_MARKER:-}" 2>/dev/null
-    # Signaling the local ssh client PIDs does NOT reach the remote vllm
-    # serve processes -- no pty was allocated, so the remote shell has
-    # nothing to forward a signal through. SIGTERM the actual remote
-    # processes directly first, so the engine gets a real chance to
-    # release NIXL registrations and GPU memory cleanly, before falling
-    # back to SIGKILL.
+    # SIGTERM the actual remote processes first, so each engine gets a real
+    # chance to release its NIXL registrations and GPU memory cleanly before
+    # anything gets SIGKILLed. Killing the launcher alone is not enough and
+    # never was: with the old two-ssh launch there was no pty for a signal to
+    # travel through, and with mpiexec, PALS's own teardown is not guaranteed
+    # to reach a grandchild EngineCore before this script exits.
     for n in "${NODE_P}" "${NODE_D}"; do
         ssh -n "$n" "pkill -TERM -f 'vllm serve'" 2>/dev/null
     done
@@ -307,7 +380,7 @@ cleanup() {
     # script exits early -- in which case PROXY_SSH_PID/TAIL_PROXY_PID were
     # never assigned, and under `set -u` referencing them bare would abort
     # cleanup() partway through, skipping everything after that line.
-    kill -TERM ${P_SSH_PID} ${D_SSH_PID} ${TAIL_P_PID} ${TAIL_D_PID} ${PROXY_SSH_PID:-} ${TAIL_PROXY_PID:-} 2>/dev/null
+    kill -TERM ${MPIEXEC_PID:-} ${TAIL_P_PID:-} ${TAIL_D_PID:-} ${TAIL_M_PID:-} ${PROXY_SSH_PID:-} ${TAIL_PROXY_PID:-} 2>/dev/null
     sleep 5
     # Belt-and-suspenders: an orphaned EngineCore child process (spawned
     # via multiprocessing) does NOT match a 'vllm serve' name pattern --
@@ -335,9 +408,20 @@ trap cleanup EXIT INT TERM
 
 wait_healthy() {
     local ip=$1 port=$2 name=$3 path=${4:-/health}
-    for i in $(seq 1 60); do
+    for i in $(seq 1 ${HEALTH_TRIES}); do
         if curl -s -o /dev/null -w "%{http_code}" http://${ip}:${port}${path} 2>/dev/null | grep -q 200; then
             echo "${name} healthy after $((i*5))s"; return 0
+        fi
+        # Fail fast instead of burning the full timeout: if mpiexec is already
+        # gone, PALS tore the application down and no amount of waiting will
+        # produce a healthy server. Skipped for the proxy, which is ssh-launched
+        # and has no relationship to MPIEXEC_PID.
+        if [ "${name#Proxy}" = "${name}" ] && ! kill -0 ${MPIEXEC_PID} 2>/dev/null; then
+            echo "mpiexec exited while waiting for ${name}."
+            echo "Look at ${SHARED}/logs/mpiexec.log first -- a PALS-level failure"
+            echo "(bad VNI, node not in the allocation, launcher error) never"
+            echo "reaches p.log or d.log at all."
+            return 1
         fi
         sleep 5
     done
@@ -346,36 +430,89 @@ wait_healthy() {
 wait_healthy ${P_IP} ${P_PORT} "Prefill (${NODE_P})" || exit 1
 wait_healthy ${D_IP} ${D_PORT} "Decode (${NODE_D})"  || exit 1
 
-if [ "${UCX_DEBUG}" = "1" ]; then
-    echo "=== UCX_DEBUG mode: instances are up with UCX_LOG_LEVEL=debug. ==="
-    echo "Send your normal disagg request now (or through the proxy once wired"
-    echo "in below), then inspect ${SHARED}/logs/{p,d}.log for the negotiated"
-    echo "transport at connection setup -- look for the device/transport name"
-    echo "near the UCX endpoint-creation lines. A CXI-related name is the"
-    echo "success case; a plain 'tcp' endpoint means it fell back."
-    echo "Skipping the timing/counter checks below in this mode -- rerun"
-    echo "without UCX_DEBUG for those."
-    exit 0
-fi
+# =============================================================================
+# Q3 (startup half) -- did the LIBFABRIC path actually come up, with the shim?
+#
+# Checked HERE, before any request, because all three of these are decided at
+# engine init. If the shim never loaded or the backend fell back, there is no
+# point sending traffic and then puzzling over the counters.
+# =============================================================================
+echo "=== Q3: transport evidence at startup ==="
+for role in p d; do
+    log=${SHARED}/logs/${role}.log
+    echo "  --- ${role} ---"
+    vni=$(grep -m1 -o 'SLINGSHOT_VNIS=[^ ]*' "${log}" 2>/dev/null)
+    echo "      ${vni:-SLINGSHOT_VNIS=<line not found>}"
+    n_shim=$(grep -c 'fi_getinfo_shim' "${log}" 2>/dev/null || true)
+    echo "      shim announcements: ${n_shim}   (0 means LD_PRELOAD did not reach the engine)"
+    grep -m3 -i 'System runtime:.*NVIDIA GPU\|rail\|LIBFABRIC' "${log}" 2>/dev/null \
+        | sed 's/^/      /' || echo "      (no LIBFABRIC/rail lines -- is NIXL_LOG_LEVEL=INFO set?)"
+done
+echo "  A healthy LIBFABRIC run shows a non-empty VNI, a non-zero shim count, and"
+echo "  the rail-manager's GPU/rail lines. Zero shim announcements with a working"
+echo "  server means it came up on UCX, and Q2's counters will be misleading."
+echo ""
 
 # =============================================================================
-# Q1 -- baseline timing: query D directly, bypassing the proxy entirely.
+# Q1 -- baseline: query D directly, bypassing the proxy entirely.
 # This is D doing its own full local prefill, same as a standalone instance.
+#
+# NOTE the prompt size. The old 6-token prompt moved ~74 KB of KV, far below
+# the noise floor of the CXI counters. See PROMPT_REPEAT at the top.
 # =============================================================================
-PROMPT="The capital of France is"
+PROMPT=$(python3 -c "print(('The quick brown fox jumps over the lazy dog. ' * ${PROMPT_REPEAT}).strip())")
+echo "Prompt: ${PROMPT_REPEAT} repeats, $(printf %s "${PROMPT}" | wc -c) chars"
+echo "  ~$(( $(printf %s "${PROMPT}" | wc -c) / 4 )) tokens -> ~$(( $(printf %s "${PROMPT}" | wc -c) / 4 * 12288 / 1000000 )) MB of KV at 12,288 B/token"
+
+# Both servers' /metrics, as a name->value map. Diffed around the disagg
+# request to answer Q1 without hardcoding metric names: vLLM renames these
+# between releases, and printing everything that MOVED is both more robust and
+# more informative than asserting on one counter we guessed at.
+snapshot_metrics() {
+    local ip=$1 port=$2 out=$3
+    curl -s "http://${ip}:${port}/metrics" 2>/dev/null \
+        | grep -v '^#' | awk '{print $1" "$2}' | sort > "${out}"
+}
+diff_metrics() {
+    local before=$1 after=$2 label=$3
+    echo "  -- ${label}: counters that changed --"
+    join "${before}" "${after}" 2>/dev/null | awk '$2 != $3 {printf "    %-60s %s -> %s\n", $1, $2, $3}' \
+        | head -40
+    join -v2 "${before}" "${after}" 2>/dev/null | awk '{printf "    %-60s (new) %s\n", $1, $2}' | head -10
+}
+
+# Body built by python3 -- json.dump, not shell interpolation. At 500 repeats
+# the prompt is ~22 KB, well past the point where hand-escaping it into a
+# -d "{...}" string is worth the risk, and python3 is guaranteed present here
+# (the conda env is already active).
+BODY_JSON=${SHARED}/req_body.json
+python3 -c "
+import json, sys
+json.dump({'model': sys.argv[1], 'prompt': sys.argv[2], 'max_tokens': 10, 'stream': True},
+          open(sys.argv[3], 'w'))
+" "${MODEL}" "${PROMPT}" "${BODY_JSON}"
 
 send_and_time() {
     local ip=$1 port=$2 label=$3
     local out=${SHARED}/logs/resp_${label}.txt
     local t
     t=$(curl -s -o ${out} -w "%{time_starttransfer}" http://${ip}:${port}/v1/completions \
-        -H "Content-Type: application/json" \
-        -d "{\"model\": \"${MODEL}\", \"prompt\": \"${PROMPT}\", \"max_tokens\": 10, \"stream\": true}")
-    echo "${label}: time_starttransfer=${t}s  (raw response: ${out})"
+        -H "Content-Type: application/json" --data-binary @${BODY_JSON})
+    echo "${label}: time_starttransfer=${t}s  (raw response: ${out})" \
+        | tee -a ${SHARED}/logs/timings.txt
 }
 
+M=${SHARED}/logs/metrics
 echo "=== Q1a: baseline -- direct to decode instance, no proxy ==="
+echo "  (P is NOT in this path at all. Whatever P's counters do here is the"
+echo "   background floor that Q1b has to beat.)"
+snapshot_metrics ${P_IP} ${P_PORT} ${M}_p_a_before
+snapshot_metrics ${D_IP} ${D_PORT} ${M}_d_a_before
 send_and_time ${D_IP} ${D_PORT} "baseline_decode_alone"
+snapshot_metrics ${P_IP} ${P_PORT} ${M}_p_a_after
+snapshot_metrics ${D_IP} ${D_PORT} ${M}_d_a_after
+diff_metrics ${M}_p_a_before ${M}_p_a_after "Q1a PREFILL node -- expected: nothing moves"
+diff_metrics ${M}_d_a_before ${M}_d_a_after "Q1a DECODE node -- expected: a full local prefill+decode"
 
 # =============================================================================
 # Direct P hop -- replicates the proxy's own first request to P by hand,
@@ -387,22 +524,25 @@ send_and_time ${D_IP} ${D_PORT} "baseline_decode_alone"
 # send_request_to_service() sends exactly this shape.
 # =============================================================================
 echo "=== Direct P hop: replicating the proxy's first request by hand ==="
+# Same python-built-body reason as send_and_time: the prompt is now ~22 KB and
+# has no business being pasted into a shell-quoted JSON literal.
+PHOP_JSON=${SHARED}/req_body_phop.json
+python3 -c "
+import json, sys
+json.dump({
+    'model': sys.argv[1], 'prompt': sys.argv[2], 'max_tokens': 1, 'stream': False,
+    'kv_transfer_params': {
+        'do_remote_decode': True, 'do_remote_prefill': False,
+        'remote_engine_id': None, 'remote_block_ids': None,
+        'remote_host': None, 'remote_port': None,
+    },
+}, open(sys.argv[3], 'w'))
+" "${MODEL}" "${PROMPT}" "${PHOP_JSON}"
+
 curl -s http://${P_IP}:${P_PORT}/v1/completions \
     -H "Content-Type: application/json" \
-    -d "{
-      \"model\": \"${MODEL}\",
-      \"prompt\": \"${PROMPT}\",
-      \"max_tokens\": 1,
-      \"stream\": false,
-      \"kv_transfer_params\": {
-        \"do_remote_decode\": true,
-        \"do_remote_prefill\": false,
-        \"remote_engine_id\": null,
-        \"remote_block_ids\": null,
-        \"remote_host\": null,
-        \"remote_port\": null
-      }
-    }" | tee ${SHARED}/logs/resp_direct_p_hop.json | python3 -m json.tool 2>/dev/null \
+    --data-binary @${PHOP_JSON} \
+    | tee ${SHARED}/logs/resp_direct_p_hop.json | python3 -m json.tool 2>/dev/null \
     || echo "(response wasn't valid JSON -- see ${SHARED}/logs/resp_direct_p_hop.json raw)"
 echo "=== Check kv_transfer_params above: real remote_engine_id/remote_block_ids/"
 echo "remote_host/remote_port means P is populating it correctly; any of"
@@ -498,6 +638,44 @@ stop_cxi_poll() {
     touch "${POLL_STOP_MARKER}"
     sleep 0.3   # >1 poll interval, let both remote loops notice and exit
 }
+
+# Wait for the counters to stop moving before stopping the pollers. A 200 ms
+# fixed sleep (what this used to do) truncates the transfer: the KV pull is
+# asynchronous with respect to the HTTP response, and the sysfs telemetry is
+# itself sampled by firmware on its own cadence, so the last octets of a
+# transfer land well after curl returns. The benchmark hit exactly this and
+# solved it the same way (read_cxi_counters_settled in
+# repro_nixl_2rank_transfer.py) -- sample until quiescent, don't guess a sleep.
+#
+# Signature = the last round of samples with the timestamp field stripped, so
+# it compares counter VALUES, not sample times. String compare, not arithmetic:
+# octet counters are 64-bit and awk would do this in doubles.
+#
+# CAVEAT: the pollers run on the remote nodes and append to ${SHARED}; if that
+# filesystem doesn't propagate appends promptly, "quiescent" here can mean
+# "not yet visible". The fixed drain below runs first for exactly that reason
+# -- it guarantees a real post-request sampling window regardless.
+cxi_signature() {
+    tail -n 4 "${SHARED}/logs/cxi_poll_p.csv" 2>/dev/null | cut -d, -f2-
+    tail -n 4 "${SHARED}/logs/cxi_poll_d.csv" 2>/dev/null | cut -d, -f2-
+}
+settle_cxi_poll() {
+    local drain=${CXI_DRAIN_S:-2}       # unconditional post-request window
+    local quiet=0 tries=0 sig prev="__init__"
+    sleep "${drain}"
+    while [ ${quiet} -lt 3 ] && [ ${tries} -lt 40 ]; do   # cap ~10s past the drain
+        sleep 0.25
+        sig=$(cxi_signature)
+        if [ "${sig}" = "${prev}" ]; then quiet=$((quiet + 1)); else quiet=0; prev="${sig}"; fi
+        tries=$((tries + 1))
+    done
+    if [ ${quiet} -ge 3 ]; then
+        echo "  CXI counters quiescent after ${drain}s drain + $(awk "BEGIN{printf \"%.1f\", ${tries} * 0.25}")s"
+    else
+        echo "  CXI counters STILL MOVING at the settle cap -- deltas below are a"
+        echo "  lower bound, not the full transfer. Raise the cap if this recurs."
+    fi
+}
 summarize_cxi_poll() {
     local outfile=$1 label=$2
     echo "  -- ${label} --"
@@ -524,10 +702,17 @@ start_cxi_poll "${NODE_D}" "${SHARED}/logs/cxi_poll_d.csv"
 sleep 0.2   # let both pollers get at least one sample before the request fires
 
 echo "=== Q1b: disagg request, through the proxy ==="
+snapshot_metrics ${P_IP} ${P_PORT} ${M}_p_b_before
+snapshot_metrics ${D_IP} ${D_PORT} ${M}_d_b_before
 send_and_time ${P_IP} ${PROXY_PORT} "disagg_via_proxy"
 
-sleep 0.2   # capture at least one post-request sample before stopping
+settle_cxi_poll
 stop_cxi_poll
+
+# Snapshot AFTER settling, not immediately after curl returns: the KV pull
+# outlives the HTTP response, and so do the counters that record it.
+snapshot_metrics ${P_IP} ${P_PORT} ${M}_p_b_after
+snapshot_metrics ${D_IP} ${D_PORT} ${M}_d_b_after
 
 echo "=== Q2 (legacy/secondary): interface counters AFTER disagg request ==="
 snapshot_counters "after"
@@ -540,13 +725,60 @@ echo "  to look at the shape rather than just the delta."
 summarize_cxi_poll "${SHARED}/logs/cxi_poll_p.csv" "Prefill (${NODE_P})"
 summarize_cxi_poll "${SHARED}/logs/cxi_poll_d.csv" "Decode (${NODE_D})"
 
-echo "=== Q1 verdict: compare baseline_decode_alone vs disagg_via_proxy above ==="
-echo "disagg time_starttransfer should be noticeably LOWER than baseline if a"
-echo "real remote KV pull happened. Roughly equal times = Q1 likely failed"
-echo "even though both requests returned 200s."
+# =============================================================================
+# Q1 verdict -- read the metric diffs, not the clock.
+#
+# The old verdict here claimed disagg TTFT "should be noticeably LOWER than
+# baseline". For a single request through 1P1D that is simply false, and
+# treating it as the pass criterion would have failed a perfectly healthy run.
+# Disagg does the SAME prefill work, then adds a KV transfer over the fabric
+# and an extra proxy hop. One request in isolation is expected to be SLOWER.
+# Disagg wins on aggregate throughput under load -- prefill and decode stop
+# contending for the same GPU -- which is `vllm bench serve`'s job, not this
+# script's. Timing is printed here only as a sanity check that neither path
+# fell off a cliff.
+#
+# What actually decides Q1 is the pair of metric diffs.
+# =============================================================================
+echo ""
+echo "=== Q1 verdict: read the metric diffs above ==="
+diff_metrics ${M}_p_b_before ${M}_p_b_after "Q1b PREFILL node -- expected: a full prefill of the prompt"
+diff_metrics ${M}_d_b_before ${M}_d_b_after "Q1b DECODE node  -- expected: request served, prefill work much smaller than Q1a"
+echo ""
+echo "  PASS looks like:"
+echo "    * Q1a moved D's counters and left P's flat  (P is not in that path)."
+echo "    * Q1b moved BOTH. P participating at all is the single most robust"
+echo "      signal -- it is name-independent and it is the whole claim: the"
+echo "      proxy really did route prefill to the other node."
+echo "    * D's prefill-side work in Q1b is much smaller than in Q1a, because"
+echo "      D received the KV instead of computing it."
+echo "  FAIL looks like:"
+echo "    * Q1b's D diff resembles Q1a's D diff and P stayed flat -- D quietly"
+echo "      did its own prefill, i.e. the connector fell back and 200s mean"
+echo "      nothing."
+echo ""
+echo "  Timing (sanity only -- disagg being slower here is EXPECTED):"
+grep -h 'time_starttransfer' ${SHARED}/logs/timings.txt 2>/dev/null || true
 
-echo "=== Log-level evidence (necessary but not sufficient on its own) ==="
-grep -i nixl ${SHARED}/logs/p.log | tail -20
-grep -i nixl ${SHARED}/logs/d.log | tail -20
+# =============================================================================
+# Q3 (transfer half) -- the startup half ran before the requests. This is the
+# part that can only be checked afterwards: did LIBFABRIC actually carry a
+# transfer, and did the shim stay in the loop?
+# =============================================================================
+echo ""
+echo "=== Q3: transport evidence after the transfer ==="
+for role in p d; do
+    log=${SHARED}/logs/${role}.log
+    echo "  -- ${role}.log --"
+    echo "     LIBFABRIC/CXI mentions:  $(grep -ci 'libfabric\|cxi' "${log}" 2>/dev/null || echo 0)"
+    echo "     shim announcements:      $(grep -c 'fi_getinfo_shim' "${log}" 2>/dev/null || echo 0)"
+    echo "     UCX mentions (want 0 on a LIBFABRIC run): $(grep -ci 'ucx' "${log}" 2>/dev/null || echo 0)"
+    grep -i 'nixl\|libfabric\|fi_getinfo_shim' "${log}" 2>/dev/null | tail -20 | sed 's/^/       /'
+done
+echo ""
+echo "  A LIBFABRIC run with UCX mentions > 0 is the failure mode to watch for:"
+echo "  a missing backend is a WARNING in NIXL's python API, not an error, so"
+echo "  the agent comes up on UCX and everything downstream still returns 200s."
 
+echo ""
 echo "Full logs at: ${SHARED}/logs/"
