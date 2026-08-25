@@ -208,7 +208,14 @@ KV_BYTES_PER_TOKEN_PER_RANK=${KV_BYTES_PER_TOKEN_PER_RANK:-6144}
 # Wall-clock budget for a server to come up. Deliberately generous: on aarch64
 # several of vLLM's CUDA extensions have no prebuilt wheel and JIT-compile on
 # first use, which is minutes, not seconds. Only slow on a cold cache.
-HEALTH_TRIES=${HEALTH_TRIES:-120}     # x5s = 10 min
+#
+# Was 120 (10 min). A measured cold start on 2026-08-25 took 9.5 min -- a
+# 30-SECOND margin, i.e. the difference between "passed" and "hung" was noise.
+# A timeout that trips on a healthy-but-slow server is worse than no timeout:
+# it produces the same silent, tracebackless failure as a real hang, and we
+# spent an afternoon chasing one of those. 360 x 5s = 30 min matches the
+# Nemotron script. It costs nothing on a warm cache, which returns in ~3 min.
+HEALTH_TRIES=${HEALTH_TRIES:-360}     # x5s = 30 min
 
 # --- Resolve the two allocated nodes -----------------------------------------
 cat ${PBS_NODEFILE}
@@ -1392,10 +1399,32 @@ echo ""
 # (Num successful transfers x Avg MB per transfer) by a few percent of wire
 # framing overhead.
 echo "=== vLLM's own NIXL transfer telemetry ==="
-if ! grep -h 'KV Transfer metrics' ${SHARED}/logs/p.log ${SHARED}/logs/d.log 2>/dev/null | tail -5 | sed 's/^/  /'; then
-    echo "  NONE FOUND. NixlConnector logs this line only once a transfer actually"
-    echo "  completes, so its absence means no KV moved -- regardless of what the"
-    echo "  HTTP status codes and the metric diffs below suggest."
+# POLL, do not grep once. This line is NOT emitted when the transfer completes.
+# It comes from vLLM's PERIODIC stats logger on its own interval (10s by
+# default), so it lands seconds after the KV has already moved, and
+# settle_cxi_poll returns as soon as the fabric goes quiet -- reliably inside
+# that window. Measured on the 18:42:05 run: transfer finished 18:45:15, this
+# check ran ~18:45:18, the metrics line appeared 18:45:23. A run whose KV
+# transfer was perfect in every other respect printed "NONE FOUND".
+#
+# Absence only means something after at least one full stats interval has
+# elapsed, so wait out two before believing it.
+_kvm=""
+_kvm_tries=0
+while [ ${_kvm_tries} -lt ${KV_METRICS_WAIT_S:-20} ]; do
+    _kvm=$(grep -h 'KV Transfer metrics' ${SHARED}/logs/p.log ${SHARED}/logs/d.log 2>/dev/null | tail -5)
+    [ -n "${_kvm}" ] && break
+    _kvm_tries=$(( _kvm_tries + 1 ))
+    sleep 1
+done
+if [ -n "${_kvm}" ]; then
+    printf '%s\n' "${_kvm}" | sed 's/^/  /'
+    [ ${_kvm_tries} -gt 0 ] && echo "  (appeared ${_kvm_tries}s after the fabric went quiet -- stats interval, not a problem)"
+else
+    echo "  NONE FOUND after ${KV_METRICS_WAIT_S:-20}s of waiting. NixlConnector logs this"
+    echo "  line once a transfer completes and the next stats interval ticks, so its"
+    echo "  absence THIS LONG after the request means no KV moved -- regardless of"
+    echo "  what the HTTP status codes and the metric diffs below suggest."
 fi
 
 echo ""
