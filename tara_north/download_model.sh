@@ -100,6 +100,83 @@ else
     exit 1
 fi
 
+# --- Completeness check --------------------------------------------------------
+# "The command exited 0" is not evidence, as the --exclude incident documented
+# below proved: a run that fetched 0.03% of the model printed a tick and
+# returned. Neither is "du looks about right" -- a truncated shard set can be
+# most of the bytes and still be unloadable.
+#
+# The only trustworthy check is the model's own manifest.
+# model.safetensors.index.json maps every tensor to the shard holding it, so the
+# set of shard names in weight_map IS the definition of complete. Compare the
+# cache against that, and look for leftover .incomplete blobs while we are here
+# (huggingface_hub stages each download as <blob>.incomplete and renames on
+# success, so one left behind is a shard interrupted mid-flight).
+#
+# Runs automatically after a foreground download, and standalone via
+#   VERIFY=1 bash download_model.sh
+verify_cache() {
+    python3 - "${MODEL}" "${HF_HOME}" <<'PY'
+import json, os, sys
+
+repo, home = sys.argv[1], sys.argv[2]
+root = os.path.join(home, "hub", "models--" + repo.replace("/", "--"))
+snaps = os.path.join(root, "snapshots")
+
+if not os.path.isdir(snaps):
+    print("  INCOMPLETE: no snapshot directory. Nothing has been downloaded.")
+    sys.exit(1)
+
+# Newest revision, in case an earlier one is still lying around.
+rev = max((os.path.join(snaps, d) for d in os.listdir(snaps)), key=os.path.getmtime)
+idx = os.path.join(rev, "model.safetensors.index.json")
+
+if not os.path.exists(idx):
+    print("  INCOMPLETE: model.safetensors.index.json is missing.")
+    print("  The weight manifest itself has not been fetched, so there is")
+    print("  nothing to verify against. Re-run without VERIFY=1 to fetch.")
+    sys.exit(1)
+
+with open(idx) as f:
+    want = sorted(set(json.load(f)["weight_map"].values()))
+
+# os.path.exists() follows symlinks, so a snapshot entry pointing at a blob
+# that was never written counts as missing -- which is exactly right here.
+missing, total = [], 0
+for name in want:
+    p = os.path.join(rev, name)
+    if os.path.exists(p):
+        total += os.path.getsize(os.path.realpath(p))
+    else:
+        missing.append(name)
+
+blobs = os.path.join(root, "blobs")
+partial = ([f for f in os.listdir(blobs) if f.endswith(".incomplete")]
+           if os.path.isdir(blobs) else [])
+
+print(f"  snapshot: {rev}")
+print(f"  shards:   {len(want) - len(missing)} of {len(want)} present")
+print(f"  weights:  {total / 1e9:.1f} GB")
+if partial:
+    print(f"  in-flight: {len(partial)} .incomplete blob(s) -- download was interrupted")
+if missing:
+    show = ", ".join(missing[:4]) + (" ..." if len(missing) > 4 else "")
+    print(f"  INCOMPLETE: {len(missing)} shard(s) missing: {show}")
+    sys.exit(1)
+if partial:
+    sys.exit(1)
+print("  COMPLETE. Safe to serve.")
+PY
+}
+
+# Standalone verification, before the space check so it costs nothing and works
+# on a full filesystem.
+if [ -n "${VERIFY:-}" ]; then
+    echo "Verifying ${MODEL} in ${HF_HOME}/hub"
+    verify_cache
+    exit $?
+fi
+
 # --- Space check -------------------------------------------------------------
 # 247 GB of shards. Ask for 300 GB: HF stages each file as <blob>.incomplete
 # and renames on completion, so peak usage is roughly the final size plus one
@@ -116,23 +193,39 @@ fi
 echo "Space at ${HF_HOME}: ${AVAIL_GB:-unknown} GB free"
 
 # --- Fetch -------------------------------------------------------------------
-# .eval_results/ and the accuracy chart are documentation, not weights. Tiny,
-# but excluding them keeps `find $HF_HOME -name '*.safetensors' | wc -l`
-# honest as a completeness check.
+# NO --exclude, deliberately, and this is scar tissue: the first run of this
+# script downloaded 78 KB and reported success.
+#
+#     --exclude ".eval_results/*" "accuracy_chart.png"
+#
+# huggingface_hub 1.x's CLI is typer-based, where --exclude takes exactly ONE
+# value per occurrence. So that parsed as --exclude=".eval_results/*" plus a
+# POSITIONAL filename "accuracy_chart.png" -- and `hf download <repo> <files>`
+# means "fetch only these files". The CLI warned ("Ignoring --exclude since
+# filenames have been explicitly set"), fetched the one png, exited 0, and
+# printed a tick.
+#
+# The typer-correct form is a repeated flag (--exclude A --exclude B), but the
+# argparse CLI in huggingface_hub 0.x reads --exclude as nargs="*", where a
+# repeated flag means last-one-wins. No single spelling is right for both
+# generations, and the entire prize is skipping ~1 MB of eval JSON and a chart.
+# Not worth a footgun whose failure mode is a successful-looking exit: fetch
+# everything, and let verify_cache() below decide what "complete" means.
 echo "Model:   ${MODEL}"
 echo "Cache:   ${HF_HOME}/hub"
 echo "Log:     ${LOG}"
 echo "Workers: ${MAX_WORKERS}   hf_transfer: ${HF_HUB_ENABLE_HF_TRANSFER}"
 echo ""
 
-CMD=("${HF_CLI[@]}" "${MODEL}"
-     --max-workers "${MAX_WORKERS}"
-     --exclude ".eval_results/*" "accuracy_chart.png")
+CMD=("${HF_CLI[@]}" "${MODEL}" --max-workers "${MAX_WORKERS}")
 
 if [ -n "${FOREGROUND:-}" ]; then
     "${CMD[@]}" 2>&1 | tee "${LOG}"
     echo ""
-    echo "Done. Verify with: bash ${BASH_SOURCE[0]}   (a complete cache returns immediately)"
+    # NOT gated on the CLI's exit status, on purpose. The whole lesson of the
+    # --exclude incident is that a zero exit says nothing about what arrived.
+    echo "=== Completeness check (manifest, not exit code) ==="
+    verify_cache
 else
     # setsid so it survives the ssh session that started it. This is hours of
     # wall clock; a dropped VPN should not cost the whole transfer. Same
@@ -149,9 +242,9 @@ else
     echo ""
     echo "  watch:    tail -f ${LOG}"
     echo "  progress: du -sh ${HF_HOME}/hub/models--${MODEL//\//--}"
-    echo "  verify:   bash ${BASH_SOURCE[0]}"
+    echo "  verify:   VERIFY=1 bash ${BASH_SOURCE[0]}"
     echo ""
-    echo "Expect ~247 GB across 50 safetensors shards. When it finishes, rerun"
-    echo "this script -- a complete cache exits in seconds having fetched"
-    echo "nothing, which is the only completeness check worth trusting."
+    echo "Expect ~247 GB across ~50 safetensors shards. VERIFY=1 checks the"
+    echo "cache against the model's own weight manifest and prints COMPLETE or"
+    echo "names the missing shards -- do that before serving, not du."
 fi
