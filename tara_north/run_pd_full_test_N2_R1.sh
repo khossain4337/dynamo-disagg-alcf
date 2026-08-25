@@ -70,7 +70,13 @@ set -uo pipefail
 NIXL_BACKEND=${NIXL_BACKEND:-LIBFABRIC}
 MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
 STAMP=$(date +%Y%m%d_%H%M%S)
-SHARED=/vast/draco/tara/projects/Tara_Deployment/software/testing/pd_smoke_${STAMP}
+# All run records live under one root rather than scattering pd_smoke_<stamp>
+# directories directly into .../testing/, which also holds source checkouts and
+# conda envs. Must be on a filesystem both compute nodes mount -- the remote
+# CXI pollers append to it, and the remote role scripts read common_env.sh and
+# launch_role.sh out of it.
+RUNS_ROOT=${RUNS_ROOT:-/vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS}
+SHARED=${RUNS_ROOT}/pd_smoke_${STAMP}
 mkdir -p ${SHARED}/logs
 P_PORT=8100; D_PORT=8200; PROXY_PORT=8000
 # Override with PROXY_SCRIPT=/your/path if your checkout lives elsewhere or
@@ -544,12 +550,28 @@ snapshot_metrics() {
     curl -s "http://${ip}:${port}/metrics" 2>/dev/null \
         | grep -v '^#' | awk '{print $1" "$2}' | sort > "${out}"
 }
+# Grouped, and the vllm: counters are UNCAPPED. This used to be a flat
+# `head -40` over everything that moved, which was actively harmful: /metrics
+# is alphabetical, so http_* and process_* sort ahead of vllm:*, and 40 lines
+# of http_request_duration histogram buckets consumed the entire budget. On the
+# first passing run that hid vllm:prompt_tokens_total -- the single counter Q1
+# is actually about -- while printing 20 near-identical bucket lines. Histogram
+# buckets are the noise here and named counters are the signal, so split them.
 diff_metrics() {
     local before=$1 after=$2 label=$3
-    echo "  -- ${label}: counters that changed --"
-    join "${before}" "${after}" 2>/dev/null | awk '$2 != $3 {printf "    %-60s %s -> %s\n", $1, $2, $3}' \
-        | head -40
-    join -v2 "${before}" "${after}" 2>/dev/null | awk '{printf "    %-60s (new) %s\n", $1, $2}' | head -10
+    local moved="${after}.moved"
+    join "${before}" "${after}" 2>/dev/null \
+        | awk '$2 != $3 {printf "%-58s %s -> %s\n", $1, $2, $3}'  > "${moved}"
+    join -v2 "${before}" "${after}" 2>/dev/null \
+        | awk '{printf "%-58s (new) %s\n", $1, $2}'              >> "${moved}"
+
+    echo "  -- ${label} --"
+    echo "     vllm counters that moved (uncapped -- these are what Q1 turns on):"
+    grep '^vllm:' "${moved}" | grep -v '_bucket' | sed 's/^/       /'
+    echo "     (plus $(grep -c '^vllm:.*_bucket' "${moved}") vllm histogram buckets)"
+    echo "     non-vllm counters that moved (first 12 of $(grep -cv '^vllm:' "${moved}")):"
+    grep -v '^vllm:' "${moved}" | head -12 | sed 's/^/       /'
+    echo "     full list: ${moved}"
 }
 
 # Body built by python3 -- json.dump, not shell interpolation. At 500 repeats
@@ -718,33 +740,52 @@ stop_cxi_poll() {
 # solved it the same way (read_cxi_counters_settled in
 # repro_nixl_2rank_transfer.py) -- sample until quiescent, don't guess a sleep.
 #
-# Signature = the last round of samples with the timestamp field stripped, so
-# it compares counter VALUES, not sample times. String compare, not arithmetic:
-# octet counters are 64-bit and awk would do this in doubles.
+# "Quiet" is a THRESHOLD, not equality. The first version required the counters
+# to be byte-identical across three consecutive samples, which can never happen:
+# these are node-wide NIC counters, and this very script is curling /metrics and
+# ssh-ing across the same NIC while it waits. Observed on the first passing run
+# -- it reported "STILL MOVING ... deltas are a lower bound" at the cap, when
+# the transfer had in fact completed and the deltas were accurate to 2.2%.
+# Crying wolf on a good run is worse than not checking at all.
+#
+# The threshold separates cleanly: background chatter is a few hundred KB per
+# 250 ms window, while the transfer itself is ~60 MB in ~10 ms -- any window
+# overlapping it is orders of magnitude above 1 MB.
+#
+# Summing in awk is safe despite these being 64-bit counters: eight values of
+# ~1e12 sum to ~1e13, and a double is exact to 9e15.
 #
 # CAVEAT: the pollers run on the remote nodes and append to ${SHARED}; if that
 # filesystem doesn't propagate appends promptly, "quiescent" here can mean
 # "not yet visible". The fixed drain below runs first for exactly that reason
 # -- it guarantees a real post-request sampling window regardless.
-cxi_signature() {
-    tail -n 4 "${SHARED}/logs/cxi_poll_p.csv" 2>/dev/null | cut -d, -f2-
-    tail -n 4 "${SHARED}/logs/cxi_poll_d.csv" 2>/dev/null | cut -d, -f2-
+cxi_total_bytes() {
+    { tail -n 4 "${SHARED}/logs/cxi_poll_p.csv" 2>/dev/null
+      tail -n 4 "${SHARED}/logs/cxi_poll_d.csv" 2>/dev/null; } \
+      | awk -F'[,=]' '{ s += $4 + $6 } END { printf "%.0f\n", s+0 }'
 }
 settle_cxi_poll() {
-    local drain=${CXI_DRAIN_S:-2}       # unconditional post-request window
-    local quiet=0 tries=0 sig prev="__init__"
+    local drain=${CXI_DRAIN_S:-2}                  # unconditional post-request window
+    local quiet_bytes=${CXI_QUIET_BYTES:-1000000}  # per 250ms sample; ~4 MB/s of noise
+    local quiet=0 tries=0 cur prev delta
     sleep "${drain}"
+    prev=$(cxi_total_bytes)
     while [ ${quiet} -lt 3 ] && [ ${tries} -lt 40 ]; do   # cap ~10s past the drain
         sleep 0.25
-        sig=$(cxi_signature)
-        if [ "${sig}" = "${prev}" ]; then quiet=$((quiet + 1)); else quiet=0; prev="${sig}"; fi
+        cur=$(cxi_total_bytes)
+        delta=$(( ${cur:-0} - ${prev:-0} ))
+        [ ${delta} -lt 0 ] && delta=$(( -delta ))
+        if [ ${delta} -lt ${quiet_bytes} ]; then quiet=$((quiet + 1)); else quiet=0; fi
+        prev=${cur}
         tries=$((tries + 1))
     done
     if [ ${quiet} -ge 3 ]; then
-        echo "  CXI counters quiescent after ${drain}s drain + $(awk "BEGIN{printf \"%.1f\", ${tries} * 0.25}")s"
+        echo "  CXI counters quiet (<${quiet_bytes} B/sample) after ${drain}s drain + $(awk "BEGIN{printf \"%.1f\", ${tries} * 0.25}")s"
     else
-        echo "  CXI counters STILL MOVING at the settle cap -- deltas below are a"
-        echo "  lower bound, not the full transfer. Raise the cap if this recurs."
+        echo "  CXI counters STILL MOVING at the settle cap (>${quiet_bytes} B/sample)."
+        echo "  Deltas below are a lower bound. Either the transfer is genuinely still"
+        echo "  running, or something else is saturating hsn0 -- check the time series"
+        echo "  in cxi_poll_{p,d}.csv before trusting the totals."
     fi
 }
 summarize_cxi_poll() {
@@ -812,6 +853,26 @@ summarize_cxi_poll "${SHARED}/logs/cxi_poll_d.csv" "Decode (${NODE_D})"
 # What actually decides Q1 is the pair of metric diffs.
 # =============================================================================
 echo ""
+# NixlConnector's own telemetry, and the best single piece of evidence in the
+# whole run -- better than anything this script computes. It reports transfer
+# count, bytes, descriptor count and achieved throughput straight from the
+# connector, so it distinguishes "a transfer happened" from "two servers each
+# returned 200" with no inference at all. It is logged on the CONSUMER (D),
+# since that is the side that issues the READ. Found by reading a passing run's
+# log, not by design; surfaced here so it is never buried again.
+#
+# Cross-checks worth doing on the numbers it prints:
+#   MB is MiB -- bytes / 12288 should be a whole multiple of the block size
+#   descriptors should equal the model's layer count
+#   the CXI tx delta below should exceed it by a few percent (wire framing)
+echo "=== vLLM's own NIXL transfer telemetry ==="
+if ! grep -h 'KV Transfer metrics' ${SHARED}/logs/p.log ${SHARED}/logs/d.log 2>/dev/null | tail -5 | sed 's/^/  /'; then
+    echo "  NONE FOUND. NixlConnector logs this line only once a transfer actually"
+    echo "  completes, so its absence means no KV moved -- regardless of what the"
+    echo "  HTTP status codes and the metric diffs below suggest."
+fi
+
+echo ""
 echo "=== Q1 verdict: read the metric diffs above ==="
 diff_metrics ${M}_p_b_before ${M}_p_b_after "Q1b PREFILL node -- expected: a full prefill of the prompt"
 diff_metrics ${M}_d_b_before ${M}_d_b_after "Q1b DECODE node  -- expected: request served, prefill work much smaller than Q1a"
@@ -843,7 +904,25 @@ for role in p d; do
     echo "  -- ${role}.log --"
     echo "     LIBFABRIC/CXI mentions:  $(grep -ci 'libfabric\|cxi' "${log}" 2>/dev/null || echo 0)"
     echo "     shim announcements:      $(grep -c 'fi_getinfo_shim' "${log}" 2>/dev/null || echo 0)"
-    echo "     UCX mentions (want 0 on a LIBFABRIC run): $(grep -ci 'ucx' "${log}" 2>/dev/null || echo 0)"
+    # A raw `grep -ci ucx` is useless as a fallback detector: a healthy
+    # LIBFABRIC run has exactly two benign UCX lines on each side, confirmed by
+    # reading them on the first passing run --
+    #   nixl_utils.py:32  vLLM sets UCX_RCACHE_MAX_UNRELEASED unconditionally,
+    #                     whatever backend was requested. Env var, not usage.
+    #   nixl_plugin_manager.cpp:621  "Discovered backend plugin: UCX" is the
+    #                     plugin manager enumerating what is loadable.
+    # Counting those as failures would fire on every good run, which just
+    # teaches you to ignore the check. Subtract the two known-benign patterns
+    # and report what is left -- that residue is what would need explaining.
+    ucx_other=$(grep -i 'ucx' "${log}" 2>/dev/null \
+        | grep -v 'UCX_RCACHE_MAX_UNRELEASED' \
+        | grep -vc 'Discovered backend plugin: UCX' || true)
+    echo "     unexplained UCX lines (want 0 on a LIBFABRIC run): ${ucx_other}"
+    if [ "${ucx_other}" -ne 0 ] 2>/dev/null; then
+        grep -i 'ucx' "${log}" 2>/dev/null \
+            | grep -v 'UCX_RCACHE_MAX_UNRELEASED' \
+            | grep -v 'Discovered backend plugin: UCX' | head -5 | sed 's/^/       ! /'
+    fi
     grep -i 'nixl\|libfabric\|fi_getinfo_shim' "${log}" 2>/dev/null | tail -20 | sed 's/^/       /'
 done
 echo ""
