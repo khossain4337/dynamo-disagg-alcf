@@ -19,9 +19,9 @@ set -uo pipefail
 #                                     -> shim PATCH lines + rail-manager lines
 #   Q4  NEW AT TP>1. Did the four TP workers spread across the four CXI NICs,
 #       or did they all pile onto one?
-#                                     -> per-worker "Rail Manager created with"
-#                                        lines, cross-checked against how many
-#                                        cxi devices actually moved octets
+#                                     -> how many cxi devices actually moved
+#                                        octets. The log lines are advisory
+#                                        only; see "WHY Q4 IS THE POINT".
 #
 # Q2/Q3 only mean something once Q1 has passed; Q4 only means something once
 # Q2 has passed.
@@ -49,15 +49,27 @@ set -uo pipefail
 # never been checked. This is the first time the one-rail-per-GPU partition is
 # exercised by vLLM rather than by the microbenchmark.
 #
-# Two independent readings, because either alone can mislead:
-#   (a) the log:  NIXL prints "Rail Manager created with N rails" once per
-#                 agent. Four workers => four such lines per node, each saying
-#                 1 rail. Four lines saying 1 rail is the healthy shape; one
-#                 line, or four lines that all name the same NIC, is not.
-#   (b) the wire: the CXI octet poll already samples all four devices. Four
-#                 rails in use means four devices with non-trivial deltas.
-#                 One device carrying everything is the failure, whatever the
-#                 log claims.
+# ANSWERED AT TP=2, 2026-08-25 (RUNS/pd_tp2_20260825_160457): the partition
+# holds. Two workers, two distinct rails, cxi0 tx=31,514,992 and cxi1
+# tx=31,264,944 while cxi2 moved 572 bytes and cxi3 moved none. vLLM's workers
+# do get distinct GPU affinities. What TP=4 still has to show is that this
+# scales to all four; two out of four could be luck of the draw.
+#
+# The reading that counts is the WIRE. The CXI octet poll samples all four
+# devices; N rails in use means N devices with non-trivial deltas, and one
+# device carrying everything is the failure whatever the log claims.
+#
+# The LOG is not a second opinion, despite an earlier revision of this file
+# claiming it was. NIXL's connection line reads "on 4 rails" at TP=2 -- it
+# counts the node's NICs, not the fan-out. Q4's log half is kept for agent
+# counting only. Details in the comment above the Q4 log half.
+#
+# Arithmetic to check the wire against, all confirmed at TP=2:
+#   payload/rank = blocks x block_size x KV_BYTES_PER_TOKEN_PER_RANK
+#   vLLM's "Avg MB per transfer" is MiB, not MB (bytes / 2^20)
+#   "remote_block_len" = block_size x per-token-per-layer bytes, so it pins
+#       down the per-rank KV head count without trusting the head arithmetic
+#   node-wide CXI tx should exceed TP x payload/rank by ~2% of framing
 #
 # -----------------------------------------------------------------------------
 # WHY ONE mpiexec AND NOT TWO ssh -- the thing that makes this file different
@@ -176,6 +188,21 @@ PROMPT_REPEAT=${PROMPT_REPEAT:-500}
 # The number below only feeds the informational "~N MB of KV" line printed with
 # the prompt. Ground truth is vLLM's own "Avg MB per transfer" in the KV
 # Transfer metrics line, which is per-worker and measured, not derived.
+#
+# CONFIRMED at TP=2, 2026-08-25, to the byte. The transfer covered 313 blocks
+# (remote_block_ids 314..626) at block_size 16 = 5,008 tokens:
+#     5,008 x 6,144 = 30,769,152 B = 29.3438 MiB
+# and vLLM printed "Avg MB per transfer=29.344". So that field is MiB, not MB
+# -- divide by 2^20, not 10^6, when checking it. A second, independent
+# confirmation came from the same log's "remote_block_len=4096": 16 tokens x
+# (1 KV head x 64 dim x 2 for K,V x 2 B) = 4,096, which pins the per-rank head
+# count at 1 without trusting the max(1, ...) arithmetic above. Note that the
+# "num_kv_heads=2" in the same TransferTopology line is the MODEL total, not
+# the per-rank count -- do not read it as a contradiction.
+#
+# For Qwen3-0.6B at TP=4: 28 layers, 8 KV heads so max(1, 8//4) = 2 per rank,
+# head_dim 128 -> 28 x 2 x 128 x 2 x 2 = 28,672 B/token/rank, and
+# remote_block_len should read 16 x 1,024 = 16,384.
 KV_BYTES_PER_TOKEN_PER_RANK=${KV_BYTES_PER_TOKEN_PER_RANK:-6144}
 
 # Wall-clock budget for a server to come up. Deliberately generous: on aarch64
@@ -732,43 +759,53 @@ echo "  server means it came up on UCX, and Q2's counters will be misleading."
 echo ""
 
 # =============================================================================
-# Q4 (log half) -- did all ${TP} workers build a NIXL agent, and how many rails
-# does each of them think it has?
+# Q4 (log half) -- did all ${TP} workers build a NIXL agent, and what does the
+# log claim about rails?
 #
-# libfabric_backend.cpp:456 prints
-#     Rail Manager created with <N> rails
-# once per agent construction, at NIXL_INFO. One agent per TP worker, so:
+# READ THIS BEFORE TRUSTING THE NUMBERS BELOW. Corrected 2026-08-25 against the
+# TP=2 run (RUNS/pd_tp2_20260825_160457). Two different NIXL log lines mention
+# "rails" and they count DIFFERENT things:
 #
-#   ${TP} lines, each "1 rails"   -> healthy. Every worker took its own GPU's
-#                                    NIC. This is the aggregate regime the
-#                                    microbenchmark measured at 87.67 GB/s.
-#   fewer than ${TP} lines        -> some workers never built an agent. Either
-#                                    the shim did not reach them or the backend
-#                                    failed there and fell back silently.
-#   ${TP} lines, all ">1 rails"   -> topology grouping fell back to
-#                                    "all accelerators use all devices"
-#                                    (libfabric_topology.cpp:698). Not fatal,
-#                                    but it means four workers are contending
-#                                    for the same four NICs instead of owning
-#                                    one each.
+#   libfabric_backend.cpp:456  "Rail Manager created with <N> rails"
+#       Per agent construction. N is how many rails that agent HOLDS.
 #
-# This is the LOG half and it is only half. A worker can report "1 rails" and
-# still have picked the same NIC as its three siblings -- the count says how
-# many it holds, not which. The wire half is Q4 below, after the transfer,
-# where the CXI counters say which devices actually moved bytes.
+#   libfabric_backend.cpp:782  "Successfully created connection for agent
+#                               <id> on <N> rails"
+#       Per peer connection. N is how many rails the connection OBJECT spans,
+#       which is every NIC on the node. On Tara this prints "on 4 rails"
+#       regardless of TP. It is NOT a fan-out measurement and a "4" here says
+#       nothing about whether the workers are sharing NICs.
+#
+# The TP=2 run printed "on 4 rails" while the wire showed each worker using
+# exactly ONE device (cxi0 tx=31.5 MB, cxi1 tx=31.3 MB, cxi2=572 B, cxi3=0).
+# Had both workers striped over four rails we would have seen four devices at
+# ~15 MB each. So: the connection spans all four NICs, but rail SELECTION per
+# transfer is by GPU affinity, one rail per worker.
+#
+# Which means this whole section is advisory. Agent count is the one thing it
+# establishes: fewer than ${TP} rail managers => some workers never built an
+# agent (shim did not reach them, or the backend failed there and fell back
+# silently). The rail COUNTS are not a verdict. The verdict is the wire half
+# below, where the CXI octet counters say which devices actually moved bytes.
 # =============================================================================
-echo "=== Q4 (log half): rail fan-out across the ${TP} TP workers ==="
+echo "=== Q4 (log half): NIXL agent construction across the ${TP} TP workers ==="
 for role in p d; do
     log=${SHARED}/logs/${role}.log
     n_rm=$(grep -c 'Rail Manager created with' "${log}" 2>/dev/null || true)
     echo "  --- ${role}: ${n_rm} rail managers, expected ${TP} (one per TP worker) ---"
     if [ "${n_rm}" -eq 0 ] 2>/dev/null; then
-        echo "      No rail-manager lines at all. Either NIXL_LOG_LEVEL is not INFO,"
-        echo "      or the LIBFABRIC backend never came up -- see Q3 above."
+        echo "      No rail-manager lines. This string is not emitted by every NIXL"
+        echo "      build at INFO -- absence is not by itself a failure. Fall back to"
+        echo "      the connection lines below and to Q3's shim-announcement count."
     else
         grep -o 'Rail Manager created with [0-9]* rails' "${log}" 2>/dev/null \
             | sort | uniq -c | sed 's/^/      /'
     fi
+    # Peer connections. Counts the node's NICs, not the fan-out -- see the
+    # header. Printed because it does confirm the LIBFABRIC backend reached
+    # the connection stage, which is more than Q3's mention-count proves.
+    n_conn=$(grep -c 'Successfully created connection for agent' "${log}" 2>/dev/null || true)
+    echo "      ${n_conn} peer connections established (spans all node NICs; not a fan-out signal)"
     # The accelerator->NIC map, printed at INFO by libfabric_topology.cpp:285.
     # Every agent prints the whole node's map, so these repeat ${TP} times;
     # dedupe. This is what a healthy 4-GPU/4-NIC partition looks like -- four

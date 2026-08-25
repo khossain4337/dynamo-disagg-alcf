@@ -682,8 +682,31 @@ EOF
 # NixlConnector docs). Leaving this unset defaults NIXL to UCX -- which is the
 # whole reason last session's run couldn't have passed Q3 regardless of UCX_TLS
 # tuning. NIXL_BACKEND=UCX still works if you want an explicit A/B later.
-KV_XFER_CONFIG_P="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"backends\":[\"${NIXL_BACKEND}\"]}}"
-KV_XFER_CONFIG_D="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"backends\":[\"${NIXL_BACKEND}\"]}}"
+#
+# kv_lease_duration -- the third knob in extra_config and the one that will
+# bite under load. base_scheduler.py:70 reads it from extra_config with a
+# default of 30, and pull_scheduler.py:244-255 uses it as the TTL on the
+# producer's blocks after request_finished(): P holds a finished request's KV
+# for this many seconds so D can still read it. The TP=2 run logged exactly
+# that -- "waiting for 30 seconds before releasing blocks".
+#
+# At one request that is invisible. At benchmark concurrency it is a hard cap
+# on P's throughput: P's usable KV cache is not its capacity but its capacity
+# divided by how many requests finish inside the lease window. Nemotron's
+# blocks are large, so P can run out of blocks while nearly all of them are
+# held for readers that finished long ago.
+#
+# 30 is left as the default for the single-shot bring-up because shortening it
+# risks D losing its source mid-read, which fails the run for a reason that
+# looks like a fabric problem. Drop it (10, then 5) for the Stage 4 sweep and
+# watch P's preemption counters -- the transfer itself took 5.1 ms at TP=2, so
+# even 5 s is three orders of magnitude of headroom. Raise it only if D starts
+# reporting failed reads.
+KV_LEASE_DURATION=${KV_LEASE_DURATION:-30}
+
+KV_EXTRA="\"backends\":[\"${NIXL_BACKEND}\"],\"kv_lease_duration\":${KV_LEASE_DURATION}"
+KV_XFER_CONFIG_P="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{${KV_EXTRA}}}"
+KV_XFER_CONFIG_D="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{${KV_EXTRA}}}"
 
 # ONE role script for both nodes, selecting by hostname. See the VNI section
 # in the header for why this cannot be two independent launches.
