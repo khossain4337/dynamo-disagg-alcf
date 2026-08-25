@@ -458,6 +458,70 @@ if [ -n "${CUDA_HOME:-}" ]; then
         fi
     fi
 fi
+
+# TRITON NEEDS A GCC-COMPATIBLE $CC AND env_for_libfabric_topology_error.sh
+# HANDS IT nvc++. This block is the difference between a server that starts and
+# one that grinds until the health check gives up. Read before removing.
+#
+# That file (lines 22-24) exports CC=CXX=CUDAHOSTCXX=nvc++. Right for the
+# nvcc/curand path directly above, wrong for Triton, which builds its
+# cuda_utils.c helper by invoking $CC with GCC flags. Measured on a login-node
+# shell, not inferred:
+#
+#   $ $CC   /tmp/t.c -O3 -shared -fPIC -Wno-psabi -o /tmp/t1.so
+#   nvc++-Error-Unknown switch: -Wno-psabi
+#   $ /opt/cray/pe/gcc-native/14/bin/gcc  <same flags>
+#   (silent)
+#
+# WHY THIS STAYED HIDDEN FOR SO LONG. Two different code paths:
+#   cold cache -> vLLM compiles from scratch; Triton's JIT reuses a
+#                 cuda_utils.so already cached in ~/.triton, so $CC is never
+#                 invoked and nvc++ is never tested.
+#   warm cache -> vLLM LOADS the binary torch_aot_compile artifact, which
+#                 rebuilds the launcher stub in a fresh /tmp dir with no
+#                 ~/.triton reuse. $CC runs for real. nvc++ fails.
+# The cache key covers model + TP + compilation config, so every run that
+# changed any of those was cold. The bug only fires on the second run of a
+# byte-identical config -- i.e. success is what arms it.
+#
+# AND IT DOES NOT LOOK LIKE AN ERROR. vLLM catches the failure, logs it at
+# WARNING (compilation/decorators.py:321), and falls back to a full recompile.
+# The workers stop servicing the shm_broadcast ring while they grind, so the
+# operator sees EngineCore repeating "No available shared memory broadcast
+# block found in 60 seconds" until wait_healthy times out: no traceback, no
+# OOM, no port conflict, and a node that looks perfectly clean.
+#
+# CC ONLY. CXX and CUDAHOSTCXX stay nvc++ -- CUDAHOSTCXX is the CUDA host
+# compiler the curand block above exists to serve, and changing it undoes that.
+#
+# Do NOT solve this with `module load gcc-native`: that modulefile is
+# family("compiler") and does load("PrgEnv-gnu"), so it evicts the NVHPC module
+# and tears down the CUDA_HOME/LIBRARY_PATH/CPATH setup this whole file depends
+# on. We want one binary, not a programming-environment switch.
+#
+# Candidates in order: explicit TRITON_CC override, the confirmed Cray gcc, then
+# whatever `gcc` resolves to on PATH (covers a future gcc-native/15).
+_TRITON_CC=""
+for _cand in "${TRITON_CC:-}" /opt/cray/pe/gcc-native/14/bin/gcc gcc; do
+    [ -n "${_cand}" ] || continue
+    if _resolved=$(command -v "${_cand}" 2>/dev/null) && [ -n "${_resolved}" ]; then
+        _TRITON_CC="${_resolved}"
+        break
+    fi
+done
+if [ -n "${_TRITON_CC}" ]; then
+    export CC="${_TRITON_CC}"
+    # Printed on purpose, and it lands in mpiexec.log because common_env.sh is
+    # sourced before launch_role.sh redirects to p.log/d.log. Silent success is
+    # precisely what made this cost an afternoon; one line per rank is cheap.
+    echo "Triton CC override: CC=${CC} (CXX/CUDAHOSTCXX left at nvc++)"
+else
+    echo "WARNING: no gcc found for Triton; leaving CC=${CC:-<unset>}." >&2
+    echo "         If that is nvc++, Triton's cuda_utils build will fail, vLLM" >&2
+    echo "         will silently fall back to recompiling, and the engine will" >&2
+    echo "         hang during startup instead of reporting an error." >&2
+    echo "         Set TRITON_CC=/path/to/gcc to fix." >&2
+fi
 EOF
 
 # --no-enable-prefix-caching matters here specifically: without it, if the
