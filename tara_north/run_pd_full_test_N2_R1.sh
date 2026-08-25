@@ -111,7 +111,18 @@ if [ -z "${NODE_P}" ] || [ -z "${NODE_D}" ]; then
     echo "Falling back to array order -- verify NODE_P/NODE_D below are correct."
     NODE_P="${NODES[0]}"; NODE_D="${NODES[1]}"
 fi
+
+# PBS_NODEFILE carries FQDNs (x4820c7s0b0n0.hostmgmt2820.north.tara.alcf.anl.gov)
+# but `hostname -s` on the compute node returns only the leading label. Keep
+# BOTH forms explicitly: ssh wants the FQDN, and launch_role.sh's hostname
+# comparison has to be short-vs-short or it never matches. This is not
+# hypothetical -- comparing a short hostname against the FQDN sent both ranks
+# down the "unexpected host" branch and killed the whole application before
+# either server started. %%.* is a no-op if PBS ever hands back short names.
+NODE_P_SHORT="${NODE_P%%.*}"
+NODE_D_SHORT="${NODE_D%%.*}"
 echo "Prefill node: ${NODE_P}   Decode node: ${NODE_D}"
+echo "  (short forms, used for the in-rank hostname match: ${NODE_P_SHORT} / ${NODE_D_SHORT})"
 
 # --- Resolve hsn0 IPs (also validates SSH works before we launch anything) --
 get_hsn_ip() {
@@ -128,21 +139,41 @@ fi
 # --- Confirm shared FS is actually visible on the remote node ---------------
 ssh -n "${NODE_D}" "test -d ${SHARED}" || { echo "SHARED path not visible on ${NODE_D} -- is /vast/draco mounted there?"; exit 1; }
 
-# --- Stage the shim and the env script into SHARED ---------------------------
-# Copied rather than referenced in place, for three reasons: both nodes are
-# then guaranteed to see byte-identical files regardless of where this repo
-# is checked out; the run becomes self-describing after the fact (the SHARED
-# dir records exactly which shim it used); and nothing depends on the repo
-# itself living on a filesystem both compute nodes mount.
+# --- Locate the shim and the env script, IN PLACE in the repo ----------------
+# Used straight from SCRIPT_DIR, not copied into SHARED. An earlier revision
+# copied them and justified it as "both nodes then see byte-identical files",
+# which is vacuous here: the repo lives on /vast, so both nodes already see the
+# same file. What the copy actually bought was a way to be running a DIFFERENT
+# binary than the one you rebuild and hand-test in the repo -- rebuild the
+# shim, LD_PRELOAD the repo copy by hand to check it, and the script would
+# still be preloading a snapshot from staging. The working benchmark
+# (run_repro_nixl_2rank_transfer.sh:189) references SCRIPT_DIR directly; match
+# it, for the same reason common_env.sh now sources the shared env script
+# rather than duplicating it.
+#
+# Provenance is kept by recording a checksum below instead of by hoarding a
+# copy of the binary in every timestamped run directory.
 for f in fi_getinfo_shim.so env_for_libfabric_topology_error.sh; do
     if [ ! -f "${SCRIPT_DIR}/${f}" ]; then
         echo "Missing ${SCRIPT_DIR}/${f} -- cannot continue."
         [ "${f}" = "fi_getinfo_shim.so" ] && echo "  Build it: gcc -shared -fPIC -o fi_getinfo_shim.so fi_getinfo_shim.c -ldl \$(pkg-config --cflags libfabric)"
         exit 1
     fi
-    cp "${SCRIPT_DIR}/${f}" "${SHARED}/${f}"
 done
-SHIM="${SHARED}/fi_getinfo_shim.so"
+SHIM="${SCRIPT_DIR}/fi_getinfo_shim.so"
+ENV_SCRIPT="${SCRIPT_DIR}/env_for_libfabric_topology_error.sh"
+
+# Referencing in place moves the burden onto SCRIPT_DIR being mounted on the
+# compute nodes, which the copy used to paper over. So check it, rather than
+# discover it as an LD_PRELOAD that silently does nothing. test -f on the shim
+# itself, not test -d on the directory -- a stale automount can satisfy the
+# latter. Checked on NODE_D because this script runs on NODE_P.
+ssh -n "${NODE_D}" "test -f ${SHIM}" || {
+    echo "${SHIM} is not visible from ${NODE_D}."
+    echo "The repo has to live on a filesystem both compute nodes mount"
+    echo "(e.g. /vast/draco/...), not in a node-local or unmounted home."
+    exit 1
+}
 
 # The tracked .so has gone stale before -- committed carrying PATCH 1 only
 # while the .c had already grown PATCHES 2-4. That build clears BLOCKER 1
@@ -151,15 +182,26 @@ SHIM="${SHARED}/fi_getinfo_shim.so"
 # broken" rather than "the shim is old". Cheap to rule out up front.
 N_PATCH=$(strings "${SHIM}" 2>/dev/null | grep -c 'PATCH [234]' || true)
 if [ "${N_PATCH}" -eq 0 ]; then
-    echo "*** STALE SHIM: ${SCRIPT_DIR}/fi_getinfo_shim.so has no PATCH 2/3/4 markers. ***"
+    echo "*** STALE SHIM: ${SHIM} has no PATCH 2/3/4 markers.                       ***"
     echo "*** It carries BLOCKER 1 only; --mem cuda / VRAM registration will fail.  ***"
     echo "*** Rebuild on this node before running:                                  ***"
     echo "***   gcc -shared -fPIC -o fi_getinfo_shim.so fi_getinfo_shim.c -ldl \$(pkg-config --cflags libfabric)"
     exit 1
 fi
-echo "Shim staged: ${SHIM} (PATCH 2/3/4 markers present)"
 
-NO_PROXY_LIST="localhost,127.0.0.1,${P_IP},${D_IP},${NODE_P},${NODE_D}"
+# Provenance, in place of the copy: which binary ran, and was it the one you
+# think you built. Written to the run directory as well as stdout so an old
+# SHARED dir can still be matched against a rebuilt shim later.
+{
+    echo "shim:      ${SHIM}"
+    echo "sha256:    $(sha256sum "${SHIM}" 2>/dev/null | awk '{print $1}')"
+    echo "built:     $(date -r "${SHIM}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+    echo "env:       ${ENV_SCRIPT}"
+    echo "env md5:   $(md5sum "${ENV_SCRIPT}" 2>/dev/null | awk '{print $1}')"
+} | tee ${SHARED}/provenance.txt
+echo "Shim OK (PATCH 2/3/4 markers present), visible from ${NODE_D}."
+
+NO_PROXY_LIST="localhost,127.0.0.1,${P_IP},${D_IP},${NODE_P},${NODE_D},${NODE_P_SHORT},${NODE_D_SHORT}"
 
 # --- Common env, sourced by both role scripts --------------------------------
 # UCX-only tunables are gated on NIXL_BACKEND so the A/B still works, but they
@@ -204,16 +246,17 @@ export https_proxy=http://proxy.alcf.anl.gov:3128
 export NO_PROXY=${NO_PROXY_LIST}
 export no_proxy=${NO_PROXY_LIST}
 
-# Conda activation and the NVHPC CUDA_HOME fixup both come from the staged
-# copy of env_for_libfabric_topology_error.sh -- the SAME file the working
-# NIXL benchmark sources. Previously this script carried its own inline
-# duplicate of that logic, which is exactly how the two drift apart and how a
-# run that "uses the same environment" quietly stops doing so.
+# Conda activation and the NVHPC CUDA_HOME fixup both come from
+# env_for_libfabric_topology_error.sh in the repo -- the SAME file, at the same
+# path, that the working NIXL benchmark sources. Previously this script carried
+# its own inline duplicate of that logic, which is exactly how the two drift
+# apart and how a run that "uses the same environment" quietly stops doing so.
+# Sourced from SCRIPT_DIR rather than a staged copy for the same reason.
 #
 # set +u across the source for the same reason the benchmark does it: conda's
 # activation machinery reads unset variables, which is fatal under nounset.
 set +u
-source ${SHARED}/env_for_libfabric_topology_error.sh
+source ${ENV_SCRIPT}
 set -u
 
 export HF_TOKEN=\$(cat ~/.hf_token)
@@ -294,14 +337,21 @@ cat > ${SHARED}/launch_role.sh <<EOF
 #!/bin/bash
 source ${SHARED}/common_env.sh
 
-if [ "\$(hostname -s)" = "${NODE_P}" ]; then
+# Short-vs-short. \$(hostname -s) is already unqualified on this system, but
+# strip any domain anyway so the comparison holds either way -- getting this
+# wrong is silent and total: both ranks fall through to the else branch, the
+# first one to exit takes the whole PALS application down with it, and neither
+# p.log nor d.log is ever written.
+MY_HOST="\$(hostname -s)"
+MY_HOST="\${MY_HOST%%.*}"
+if [ "\${MY_HOST}" = "${NODE_P_SHORT}" ]; then
     ROLE=p
     LOG=${SHARED}/logs/p.log
     PORT=${P_PORT}
     SIDE_HOST=${P_IP}
     SIDE_PORT=5600
     KV_CFG='${KV_XFER_CONFIG_P}'
-elif [ "\$(hostname -s)" = "${NODE_D}" ]; then
+elif [ "\${MY_HOST}" = "${NODE_D_SHORT}" ]; then
     ROLE=d
     LOG=${SHARED}/logs/d.log
     PORT=${D_PORT}
@@ -309,7 +359,9 @@ elif [ "\$(hostname -s)" = "${NODE_D}" ]; then
     SIDE_PORT=5601
     KV_CFG='${KV_XFER_CONFIG_D}'
 else
-    echo "Rank landed on unexpected host \$(hostname -s); expected ${NODE_P} or ${NODE_D}." >&2
+    echo "Rank landed on unexpected host '\${MY_HOST}'." >&2
+    echo "  expected one of: '${NODE_P_SHORT}' (prefill) or '${NODE_D_SHORT}' (decode)" >&2
+    echo "  full node names from PBS_NODEFILE: ${NODE_P} / ${NODE_D}" >&2
     exit 1
 fi
 
@@ -348,14 +400,33 @@ MPIEXEC_PID=$!
 # readable. `sed -u` (unbuffered) matters here -- without it, output piped
 # through sed gets block-buffered and shows up in silent bursts instead of
 # line-by-line, which looks exactly like "nothing is happening" even when it is.
+#
+# disown after each: cleanup() kills these, and without disown bash reports
+# every one as a job-status line ("PID Killed exit 1") mixed into the teardown
+# output, which reads like a fresh error at exactly the moment you are trying
+# to work out what the real one was. Disowning only drops them from the job
+# table; kill -TERM on the saved PID still works.
 tail -n +1 -f ${SHARED}/logs/p.log | sed -u 's/^/[P] /' &
-TAIL_P_PID=$!
+TAIL_P_PID=$!; disown ${TAIL_P_PID}
 tail -n +1 -f ${SHARED}/logs/d.log | sed -u 's/^/[D] /' &
-TAIL_D_PID=$!
+TAIL_D_PID=$!; disown ${TAIL_D_PID}
 # mpiexec's own stream carries PALS errors that never reach either role log --
 # a launch that dies before the role script runs is otherwise completely silent.
 tail -n +1 -f ${SHARED}/logs/mpiexec.log | sed -u 's/^/[MPI] /' &
-TAIL_M_PID=$!
+TAIL_M_PID=$!; disown ${TAIL_M_PID}
+
+# pgrep/pkill patterns are bracketed ('[v]llm serve', not 'vllm serve') for a
+# specific reason. `ssh host "pkill -f 'vllm serve'"` runs the command through
+# `bash -c "pkill -f 'vllm serve'"` on the far side, and THAT shell's command
+# line contains the literal string being searched for -- so pgrep/pkill match
+# their own parent. Observed: cleanup reported "Stray vllm process ... force
+# killing" on a run where no server ever started, then killed the wrapper shell
+# and took the local ssh child down with it ("Killed exit 1" in the teardown
+# output). The bracket makes the regex match the real process but not the
+# command line containing the regex.
+PAT_VLLM='[v]llm serve'
+PAT_ENGINE='[E]ngineCore'
+PAT_PROXY='[t]oy_proxy_server.py'
 
 cleanup() {
     echo "=== Cleaning up ==="
@@ -372,9 +443,9 @@ cleanup() {
     # travel through, and with mpiexec, PALS's own teardown is not guaranteed
     # to reach a grandchild EngineCore before this script exits.
     for n in "${NODE_P}" "${NODE_D}"; do
-        ssh -n "$n" "pkill -TERM -f 'vllm serve'" 2>/dev/null
+        ssh -n "$n" "pkill -TERM -f \"${PAT_VLLM}\"" 2>/dev/null
     done
-    ssh -n "${NODE_P}" "pkill -TERM -f 'toy_proxy_server.py'" 2>/dev/null
+    ssh -n "${NODE_P}" "pkill -TERM -f \"${PAT_PROXY}\"" 2>/dev/null
     # :- guards matter here: cleanup can fire (via the EXIT trap) before the
     # proxy block ever runs -- e.g. if P or D fails its health check and the
     # script exits early -- in which case PROXY_SSH_PID/TAIL_PROXY_PID were
@@ -391,16 +462,16 @@ cleanup() {
     # later run. Kill both patterns, and free the known ports directly
     # too rather than relying on process-name matching alone.
     for n in "${NODE_P}" "${NODE_D}"; do
-        ssh -n "$n" "pkill -KILL -f 'EngineCore'" 2>/dev/null
+        ssh -n "$n" "pkill -KILL -f \"${PAT_ENGINE}\"" 2>/dev/null
     done
-    ssh -n "${NODE_P}" "pkill -KILL -f 'toy_proxy_server.py'" 2>/dev/null
+    ssh -n "${NODE_P}" "pkill -KILL -f \"${PAT_PROXY}\"" 2>/dev/null
     ssh -n "${NODE_P}" "fuser -k 5600/tcp" 2>/dev/null
     ssh -n "${NODE_D}" "fuser -k 5601/tcp" 2>/dev/null
     ssh -n "${NODE_P}" "fuser -k ${PROXY_PORT}/tcp" 2>/dev/null
     for n in "${NODE_P}" "${NODE_D}"; do
-        if ssh -n "$n" "pgrep -f 'vllm serve'" > /dev/null 2>&1; then
+        if ssh -n "$n" "pgrep -f \"${PAT_VLLM}\"" > /dev/null 2>&1; then
             echo "Stray vllm process on $n -- force killing."
-            ssh -n "$n" "pkill -KILL -f 'vllm serve'"
+            ssh -n "$n" "pkill -KILL -f \"${PAT_VLLM}\""
         fi
     done
 }
