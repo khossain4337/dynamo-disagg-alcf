@@ -39,7 +39,7 @@ set -uo pipefail
 #
 # USAGE
 #   bash run_colocated_N1.sh                      # 32k context, holds the server
-#   MAX_MODEL_LEN=139264 bash run_colocated_N1.sh # the Figure 2 pilot
+#   MAX_MODEL_LEN=147456 bash run_colocated_N1.sh # the Figure 2 pilot
 #   KEEP_ALIVE=0 bash run_colocated_N1.sh         # bring up, verify, tear down
 # =============================================================================
 
@@ -68,13 +68,21 @@ ENFORCE_EAGER=${ENFORCE_EAGER:-}
 # --- MAX_MODEL_LEN: defaults to the disagg script's default ON PURPOSE -------
 # 32768, matching run_pd_nemotron_1p1d_N2.sh:262, so that running both arms
 # with no environment at all gives two comparable servers. The Figure 2 pilot
-# needs 139264 (ISL 131072 + OSL 8192) and that number must be passed to BOTH
-# arms in the same breath:
+# needs MORE than 139264 (ISL 131072 + OSL 8192) and that number must be passed
+# to BOTH arms in the same breath:
 #
-#     MAX_MODEL_LEN=139264 bash run_colocated_N1.sh
-#     MAX_MODEL_LEN=139264 bash run_pd_nemotron_1p1d_N2.sh
+#     MAX_MODEL_LEN=147456 bash run_colocated_N1.sh
+#     MAX_MODEL_LEN=147456 bash run_pd_nemotron_1p1d_N2.sh
 #
-# It is NOT changed to 139264 as a default here, because the disagg script's
+# 147456, not 139264, and the 8192 of slack is not superstition. Setting it to
+# exactly ISL+OSL was tried on 2026-09-11 and one warmup request still came back
+# HTTP 400: `vllm bench serve --dataset-name random` synthesises prompts that
+# land NEAR --random-input-len, not on it, so an exactly-fitting budget rejects
+# whichever prompts round up. The rejection is instant, so it registers on the
+# progress bar as a completed request -- 1/32 in under four seconds -- and reads
+# as progress. Give it a block of headroom and the ambiguity goes away.
+#
+# It is NOT changed as a default here, because the disagg script's
 # in-file default is frozen and a default that differs between the two arms is
 # worse than one that is merely inconvenient. The preflight below warns when
 # this is too small for the settled workload -- at 32768 a 128k request is
@@ -375,13 +383,17 @@ chmod +x "${SHARED}/launch_colocated.sh"
 cat "${SHARED}/run_config.txt"
 
 # --- The workload guard that handoff item 2 exists to fix --------------------
-# ISL 131072 + OSL 8192 = 139264. Below that, bench_arm.sh's requests come back
-# HTTP 400 before a single token is processed, and it looks like a harness fault.
-_PILOT_CTX=139264
+# ISL 131072 + OSL 8192 = 139264, and the guard wants STRICTLY more than that.
+# At exactly 139264 the random dataset's prompt-length jitter still produced an
+# HTTP 400 on 2026-09-11 (see the MAX_MODEL_LEN block above). Below the bar,
+# requests come back 400 before a single token is processed -- instantly, which
+# is why it reads as a fast request rather than as a harness fault.
+_PILOT_CTX=147456
 if [ "${MAX_MODEL_LEN}" -lt "${_PILOT_CTX}" ]; then
     echo ""
     echo "NOTE: max-model-len ${MAX_MODEL_LEN} < ${_PILOT_CTX}, so the settled Figure 2"
-    echo "      workload (ISL 131072 / OSL 8192) will be REJECTED with HTTP 400."
+    echo "      workload (ISL 131072 / OSL 8192, plus dataset jitter) risks being"
+    echo "      REJECTED with HTTP 400."
     echo "      Fine for a smoke run. For the pilot, pass it to BOTH arms:"
     echo "          MAX_MODEL_LEN=${_PILOT_CTX} bash run_colocated_N1.sh"
     echo "          MAX_MODEL_LEN=${_PILOT_CTX} bash run_pd_nemotron_1p1d_N2.sh"
@@ -499,6 +511,20 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
     _ka_stop=0
     trap '_ka_stop=1; echo ""; echo "Interrupt received -- releasing server."' INT TERM
 
+    # The heartbeat reports the ENGINE, not the log's last line.
+    #
+    # Blind-tailing the log was actively misleading: the last line is almost
+    # always the `GET /health` access log entry that this very loop just
+    # produced, so the heartbeat reported itself, at 200, once a minute, while
+    # the engine behind it had not stepped in twelve minutes (2026-09-11).
+    #
+    # loggers.py:310 is vLLM's periodic stats line. It prints roughly every 10 s
+    # for as long as the engine is stepping and stops the instant it is not, so
+    # "unchanged since the last poll" is a direct read on whether work is
+    # moving -- which /health cannot give, because the API server is a separate
+    # process from EngineCore and answers 200 long after the engine has stopped.
+    _ka_last=""
+    _ka_stall=0
     _ka_t0=$(date +%s)
     while [ "${_ka_stop}" -eq 0 ]; do
         if ! kill -0 "${SERVE_PID}" 2>/dev/null; then
@@ -510,10 +536,31 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
         sleep "${KEEP_ALIVE_POLL_S}"
         _ka_el=$(( $(date +%s) - _ka_t0 ))
         _ka_h=$(curl -s -o /dev/null -w '%{http_code}' "http://${IP}:${PORT}/health" 2>/dev/null || echo "---")
+        _ka_eng=$(grep -F 'loggers.py:310' "${LOG}" 2>/dev/null | tail -n 1 \
+                    | sed 's/.*Engine 000: //' | cut -c1-110)
         printf '  [keep-alive %02d:%02d:%02d] health=%s | %s\n' \
             $(( _ka_el / 3600 )) $(( (_ka_el % 3600) / 60 )) $(( _ka_el % 60 )) \
             "${_ka_h}" \
-            "$(tail -n 1 "${LOG}" 2>/dev/null | cut -c1-100)"
+            "${_ka_eng:-<no engine stats yet -- idle or still loading>}"
+
+        if [ -n "${_ka_eng}" ] && [ "${_ka_eng}" = "${_ka_last}" ]; then
+            _ka_stall=$(( _ka_stall + 1 ))
+        else
+            _ka_stall=0
+        fi
+        _ka_last=${_ka_eng}
+
+        # Two identical polls is >=2*KEEP_ALIVE_POLL_S with no engine step, against
+        # a line that normally advances every 10 s. That is not slowness.
+        if [ "${_ka_stall}" -ge 2 ]; then
+            echo "      ^^ STALLED: no engine step in $(( _ka_stall * KEEP_ALIVE_POLL_S ))s."
+            echo "         health=200 proves nothing here -- APIServer is a separate pid."
+            echo "         Capture the stacks BEFORE Ctrl-C, or the cause dies with it:"
+            echo "             pgrep -a -f 'EngineCore|VLLM::Worker_TP'"
+            echo "             py-spy dump --pid <EngineCore pid>"
+            echo "             py-spy dump --pid <Worker_TP0 pid>"
+            echo "         Then nvidia-smi, then Ctrl-C."
+        fi
     done
 
     trap cleanup EXIT INT TERM

@@ -38,8 +38,21 @@ ISL=${ISL:-131072}
 OSL=${OSL:-8192}
 NUM_PROMPTS=${NUM_PROMPTS:-128}
 # Client-side offered load, and the knob that actually controls concurrency.
-# --max-num-seqs is a server-side CAP: at 136k tokens a sequence costs 2.41 GB
-# of KV, so ~53-63 sequences exhaust the budget on 4x120 GB and the rest queue.
+# --max-num-seqs is a server-side CAP, but it is NOT the binding one: KV is.
+#
+# MEASURED on the colocated arm 2026-09-11 (run colocated_tp4_20260911_052433),
+# TP=4, gpu-memory-utilization 0.90, MAX_MODEL_LEN=139264:
+#     Available KV cache memory:  23.43 GiB per rank   (NOT the ~48 GB the
+#                                 launcher comments estimate -- weights plus
+#                                 non-torch came to 58.7-60.7 GiB, peak
+#                                 activation 3.35 GiB, cudagraph pool 0.89 GiB)
+#     GPU KV cache size:          5,222,400 tokens
+#     Maximum concurrency for 139,264 tokens per request:  37.50x
+#
+# So ~37 is the hard ceiling at this ISL on 4 GPUs, and it applies to the disagg
+# arm too -- D holds the same sequences' KV on the same 4 GPUs. Any Figure 2
+# concurrency sweep has to live below it in BOTH arms.
+#
 # Leaving this unset makes p95 TTFT a measurement of the queue, not of prefill.
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-32}
 
@@ -50,6 +63,23 @@ MAX_CONCURRENCY=${MAX_CONCURRENCY:-32}
 # vllm bench serve has no warmup-discard of its own, so it is a separate,
 # thrown-away run. Set WARMUP_PROMPTS=0 only to measure the compile itself.
 WARMUP_PROMPTS=${WARMUP_PROMPTS:-${MAX_CONCURRENCY}}
+#
+# The warmup runs at the FULL ISL but a SHORT OSL, and the asymmetry is
+# deliberate. Kernel selection is a function of shape, and the shapes that
+# matter are the prefill chunk (set by ISL and --max-num-batched-tokens) and the
+# steady-state decode batch (set by concurrency). Neither depends on how many
+# tokens each request goes on to emit. Warming at OSL=8192 therefore compiles
+# nothing that OSL=128 does not, and costs 64x the decode steps to do it.
+#
+# 2026-09-11: warming at the full 8192 was not merely wasteful, it never
+# finished. At concurrency 32 the observed aggregate decode rate was ~34 tok/s,
+# so 8192 tokens x 32 sequences is ~2 hours of warmup before the measured run
+# starts. The run was killed at 16 minutes still inside warmup.
+#
+# 128 is enough to (a) drain every prefill, (b) reach a pure-decode batch, and
+# (c) let requests actually COMPLETE and release their KV -- which is itself a
+# test the 8192 warmup never got far enough to perform.
+WARMUP_OSL=${WARMUP_OSL:-128}
 
 # --- Where results land -------------------------------------------------------
 # NOT the current directory. This script is run from the checkout, and results
@@ -87,7 +117,7 @@ echo "=== bench_arm: ${ARM} ==="
 echo "  endpoint    ${BASE_URL}"
 echo "  metrics     ${METRICS_URLS}"
 echo "  workload    ISL=${ISL} OSL=${OSL} n=${NUM_PROMPTS} concurrency=${MAX_CONCURRENCY}"
-echo "  warmup      ${WARMUP_PROMPTS} prompts (discarded)"
+echo "  warmup      ${WARMUP_PROMPTS} prompts at OSL=${WARMUP_OSL} (discarded)"
 echo "  out         ${OUT_DIR}"
 echo ""
 
@@ -121,6 +151,34 @@ if ! printf '%s' "${_probe}" | grep -q '"choices"'; then
 fi
 echo "  preflight   one-token completion OK"
 
+# --- Preflight 2: does ISL + OSL actually fit --max-model-len? -----------------
+# 2026-09-11: MAX_MODEL_LEN was set to exactly 131072 + 8192 = 139264, and the
+# warmup still took one "POST /v1/completions HTTP/1.1" 400 Bad Request. The
+# random dataset does not hit the requested input length to the token, so an
+# exactly-fitting budget is a coin flip per prompt. The rejected request costs
+# more than a retry: it dies instantly, so the progress bar jumps to 1/N in
+# three seconds and reads as progress while nothing is progressing.
+#
+# Scrape from METRICS_URLS, not BASE_URL -- the disagg arm's BASE_URL is
+# toy_proxy_server.py, which serves no /v1/models (see CLOSED.md).
+_first_metrics=${METRICS_URLS%%,*}
+_mml=$(curl -sf --max-time 10 "${_first_metrics}/v1/models" 2>/dev/null \
+        | tr ',' '\n' | grep -o '"max_model_len"[[:space:]]*:[[:space:]]*[0-9]\+' \
+        | grep -o '[0-9]\+$' | head -1)
+if [ -n "${_mml}" ]; then
+    _need=$(( ISL + OSL ))
+    echo "  preflight   max_model_len=${_mml}, ISL+OSL=${_need}"
+    if [ "${_need}" -ge "${_mml}" ]; then
+        echo "FATAL: ISL + OSL = ${_need} does not leave headroom under" >&2
+        echo "  --max-model-len=${_mml}. Requests will be rejected with HTTP 400" >&2
+        echo "  before any KV moves, and a rejected request looks like a fast one." >&2
+        echo "  Relaunch with MAX_MODEL_LEN=$(( (_need + 8192 + 4095) / 4096 * 4096 ))." >&2
+        exit 1
+    fi
+else
+    echo "  preflight   WARN: could not read max_model_len from ${_first_metrics}" >&2
+fi
+
 # --- Config fingerprint -------------------------------------------------------
 # The comparison is only valid if the two arms differ ONLY in the P/D split and
 # the NIXL connector. Everything observable is recorded per arm so that a diff
@@ -142,6 +200,8 @@ cat > "${OUT_DIR}/config.json" <<EOF
   "num_prompts": ${NUM_PROMPTS},
   "max_concurrency": ${MAX_CONCURRENCY},
   "warmup_prompts": ${WARMUP_PROMPTS},
+  "warmup_osl": ${WARMUP_OSL},
+  "server_max_model_len": ${_mml:-null},
   "started": "$(date -Is)"
 }
 EOF
@@ -161,7 +221,7 @@ snapshot_metrics() {
 }
 
 run_bench() {
-    local label=$1 n=$2 outfile=$3
+    local label=$1 n=$2 osl=$3 outfile=$4
     vllm bench serve \
         --backend openai \
         --base-url "${BASE_URL}" \
@@ -169,7 +229,7 @@ run_bench() {
         --model "${MODEL}" \
         --dataset-name random \
         --random-input-len "${ISL}" \
-        --random-output-len "${OSL}" \
+        --random-output-len "${osl}" \
         --ignore-eos \
         --temperature 0 \
         --num-prompts "${n}" \
@@ -183,15 +243,28 @@ run_bench() {
 
 # --- Warmup (discarded) -------------------------------------------------------
 if [ "${WARMUP_PROMPTS}" -gt 0 ]; then
-    echo "--- warmup (${WARMUP_PROMPTS} prompts, results discarded) ---"
-    run_bench warmup "${WARMUP_PROMPTS}" "${OUT_DIR}/warmup_result.json"
+    echo "--- warmup (${WARMUP_PROMPTS} prompts, OSL=${WARMUP_OSL}, results discarded) ---"
+    run_bench warmup "${WARMUP_PROMPTS}" "${WARMUP_OSL}" "${OUT_DIR}/warmup_result.json"
+    _warm_rc=$?
     echo ""
+    # A warmup that did not finish means the measured run is about to start on a
+    # cold engine at best, and into a wedged one at worst. Stopping here costs a
+    # relaunch; continuing costs the node-hour AND produces percentiles nobody
+    # can quote. 2026-09-11: the first colocated attempt died inside warmup and
+    # the harness had no opinion about it.
+    if [ "${_warm_rc}" -ne 0 ]; then
+        echo "FATAL: warmup exited ${_warm_rc}. Not starting the measured run." >&2
+        echo "  Warmup log: ${OUT_DIR}/warmup.log" >&2
+        echo "  Check the server log for an HTTP 400 (ISL+OSL over --max-model-len)" >&2
+        echo "  or a stalled engine (no loggers.py:310 line for minutes)." >&2
+        exit 1
+    fi
 fi
 
 # --- Measured run -------------------------------------------------------------
 snapshot_metrics before
 echo "--- measured run (${NUM_PROMPTS} prompts) ---"
-run_bench measured "${NUM_PROMPTS}" "${OUT_DIR}/result.json"
+run_bench measured "${NUM_PROMPTS}" "${OSL}" "${OUT_DIR}/result.json"
 BENCH_RC=$?
 snapshot_metrics after
 
