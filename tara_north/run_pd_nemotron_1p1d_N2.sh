@@ -423,6 +423,24 @@ MAMBA_STATE_BYTES_PER_SEQ_PER_RANK=${MAMBA_STATE_BYTES_PER_SEQ_PER_RANK:-4270000
 # ten minutes is a hang, not slowness.
 HEALTH_TRIES=${HEALTH_TRIES:-360}     # x5s = 30 min
 
+# --- KEEP_ALIVE: hold the servers up for an external bench client -------------
+# Default 0 preserves the historical behaviour exactly: run the Q-checks, fall
+# off the end, EXIT trap tears both servers down. Set to 1 and the script blocks
+# after the checks instead of exiting, so `vllm bench serve` has something to
+# talk to.
+#
+# It has to BLOCK rather than background-and-exit. mpiexec is a child of this
+# shell (MPIEXEC_PID), and PALS ties the application's lifetime to the launcher:
+# if this script exits, the EXIT trap fires cleanup() and both engines die --
+# and even suppressing the trap would leave mpiexec orphaned with no parent to
+# signal it. Blocking in the foreground keeps the process tree intact and makes
+# Ctrl-C (INT -> the same trap) the intended teardown path.
+KEEP_ALIVE=${KEEP_ALIVE:-0}
+# Heartbeat interval for the hold loop. A silent terminal for an hour is
+# indistinguishable from a dead one, which is the same complaint the deferred
+# wait_healthy heartbeat exists to fix; do not set this to 0.
+KEEP_ALIVE_POLL_S=${KEEP_ALIVE_POLL_S:-60}
+
 # --- Resolve the two allocated nodes -----------------------------------------
 cat ${PBS_NODEFILE}
 mapfile -t NODES < <(sort -u "${PBS_NODEFILE}")
@@ -603,140 +621,26 @@ if [ -n "${GPU_ID:-}" ]; then
     echo "GPU_ID=${GPU_ID} set -- pinning CUDA_VISIBLE_DEVICES=${GPU_ID} for both P and D."
 fi
 
-cat > ${SHARED}/common_env.sh <<EOF
-export HTTP_PROXY=http://proxy.alcf.anl.gov:3128
-export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128
-export http_proxy=http://proxy.alcf.anl.gov:3128
-export https_proxy=http://proxy.alcf.anl.gov:3128
-export NO_PROXY=${NO_PROXY_LIST}
-export no_proxy=${NO_PROXY_LIST}
-
-# Conda activation and the NVHPC CUDA_HOME fixup both come from
-# env_for_libfabric_topology_error.sh in the repo -- the SAME file, at the same
-# path, that the working NIXL benchmark sources. Previously this script carried
-# its own inline duplicate of that logic, which is exactly how the two drift
-# apart and how a run that "uses the same environment" quietly stops doing so.
-# Sourced from SCRIPT_DIR rather than a staged copy for the same reason.
+# The common_env.sh body used to live inline here. It moved to
+# emit_common_env.sh so that run_colocated_N1.sh -- the Figure 2 baseline arm --
+# generates a byte-identical environment from the same source. The two arms are
+# only comparable if they differ in the P/D split and nothing else; a second
+# copy of this block is exactly how that stops being true, and it is the same
+# drift the "inline duplicate of env_for_libfabric_topology_error.sh" comment
+# inside the generated file is already complaining about. One copy.
 #
-# set +u across the source for the same reason the benchmark does it: conda's
-# activation machinery reads unset variables, which is fatal under nounset.
-set +u
-source ${ENV_SCRIPT}
-set -u
-
-export HF_TOKEN=\$(cat ~/.hf_token)
-export PYTHONNOUSERSITE=1
-export HF_HOME=/vast/draco/tara/projects/Tara_Deployment/software/model-weights
-export HF_DATASETS_CACHE=\${HF_HOME}
-export HF_MODULES_CACHE=\${HF_HOME}
-export RAY_TMPDIR=/tmp
-export TMPDIR=/tmp
-export VLLM_LOGGING_LEVEL=INFO
-${UCX_LINES}
-${GPU_PIN_LINE}
-EOF
-
-# Appended with a QUOTED heredoc delimiter ('EOF') so the paths below are
-# resolved when common_env.sh actually RUNS on the compute node, not now on
-# whichever node this launcher script happens to be running on -- login and
-# compute node module environments aren't guaranteed to match on Cray systems.
-#
-# Everything the old inline block did -- CC/CXX/CUDAHOSTCXX=nvc++, CUDA_HOME,
-# LIBRARY_PATH, LD_LIBRARY_PATH, CPATH and the math_libs LIB dir -- now comes
-# from env_for_libfabric_topology_error.sh, sourced above. This appendix keeps
-# the ONE thing that file does not do.
-cat >> ${SHARED}/common_env.sh <<'EOF'
-
-# CONFIRMED (not guessed) from an actual "curandStatePhilox4_32_10_t
-# undefined" failure: the CUDA math-library HEADERS -- curand, and by strong
-# implication cublas/cusparse/cusolver/cufft -- live in a SEPARATE sibling
-# tree, math_libs/<ver>/targets/<arch>/include, not inside cuda/<ver>/ at all.
-# env_for_libfabric_topology_error.sh puts the math_libs LIB dir on
-# LIBRARY_PATH/LD_LIBRARY_PATH but never adds its INCLUDE dir to CPATH, so a
-# JIT compile that needs curand_kernel.h still fails without this block.
-#
-# Derived from CUDA_HOME (which that file exports) rather than from its
-# internal shell variables, so this stays correct if it is ever refactored.
-if [ -n "${CUDA_HOME:-}" ]; then
-    _REAL_CUDA_LIB_DIR=$(find "${CUDA_HOME}" -name "libcudart.so" -printf '%h\n' 2>/dev/null | head -1)
-    if [ -n "${_REAL_CUDA_LIB_DIR}" ]; then
-        _TARGET_ROOT=$(dirname "${_REAL_CUDA_LIB_DIR}")           # .../targets/<arch>
-        _NVHPC_VER_ROOT=$(dirname "$(dirname "${CUDA_HOME}")")    # .../<ver>
-        _MATH_INC="${_NVHPC_VER_ROOT}/math_libs/$(basename "${CUDA_HOME}")/targets/$(basename "${_TARGET_ROOT}")/include"
-        if [ -d "${_MATH_INC}" ]; then
-            export CPATH="${_MATH_INC}:${CPATH:-}"
-        else
-            echo "WARNING: math_libs include dir not found at ${_MATH_INC}" >&2
-            echo "         A JIT build needing curand_kernel.h will fail." >&2
-        fi
-    fi
+# emit_common_env() reads NO_PROXY_LIST, ENV_SCRIPT, UCX_LINES and GPU_PIN_LINE
+# out of this scope -- all four are set above -- and takes the destination path
+# as its argument.
+if [ ! -f "${SCRIPT_DIR}/emit_common_env.sh" ]; then
+    echo "FATAL: ${SCRIPT_DIR}/emit_common_env.sh is missing."
+    echo "It carries the math_libs CPATH repair and the Triton \$CC override."
+    echo "Without them the engines do not fail -- they grind through a silent"
+    echo "recompile until wait_healthy times out. Refusing to launch."
+    exit 1
 fi
-
-# TRITON NEEDS A GCC-COMPATIBLE $CC AND env_for_libfabric_topology_error.sh
-# HANDS IT nvc++. This block is the difference between a server that starts and
-# one that grinds until the health check gives up. Read before removing.
-#
-# That file (lines 22-24) exports CC=CXX=CUDAHOSTCXX=nvc++. Right for the
-# nvcc/curand path directly above, wrong for Triton, which builds its
-# cuda_utils.c helper by invoking $CC with GCC flags. Measured, not inferred:
-#
-#   $ $CC   /tmp/t.c -O3 -shared -fPIC -Wno-psabi -o /tmp/t1.so
-#   nvc++-Error-Unknown switch: -Wno-psabi
-#   $ /opt/cray/pe/gcc-native/14/bin/gcc  <same flags>
-#   (silent)
-#
-# WHY THIS STAYED HIDDEN FOR SO LONG. Two different code paths:
-#   cold cache -> vLLM compiles from scratch; Triton's JIT reuses a
-#                 cuda_utils.so already cached in ~/.triton, so $CC is never
-#                 invoked and nvc++ is never tested.
-#   warm cache -> vLLM LOADS the binary torch_aot_compile artifact, which
-#                 rebuilds the launcher stub in a fresh /tmp dir with no
-#                 ~/.triton reuse. $CC runs for real. nvc++ fails.
-# The cache key covers model + TP + compilation config, so every run that
-# changed any of those was cold. The bug only fires on the second run of a
-# byte-identical config -- i.e. success is what arms it. Diagnosed on the Qwen
-# TP=4 rig; this script had never completed a run, so it had never written a
-# cache, and would have hit it on its SECOND run -- after a ~240 GB weight load.
-#
-# AND IT DOES NOT LOOK LIKE AN ERROR. vLLM catches the failure, logs it at
-# WARNING (compilation/decorators.py:321), and falls back to a full recompile.
-# The workers stop servicing the shm_broadcast ring while they grind, so the
-# operator sees EngineCore repeating "No available shared memory broadcast
-# block found in 60 seconds" until wait_healthy times out: no traceback, no
-# OOM, no port conflict, and a node that looks perfectly clean.
-#
-# CC ONLY. CXX and CUDAHOSTCXX stay nvc++ -- CUDAHOSTCXX is the CUDA host
-# compiler the curand block above exists to serve, and changing it undoes that.
-#
-# Do NOT solve this with `module load gcc-native`: that modulefile is
-# family("compiler") and does load("PrgEnv-gnu"), so it evicts the NVHPC module
-# and tears down the CUDA_HOME/LIBRARY_PATH/CPATH setup this whole file depends
-# on. We want one binary, not a programming-environment switch.
-#
-# Candidates in order: explicit TRITON_CC override, the confirmed Cray gcc, then
-# whatever `gcc` resolves to on PATH (covers a future gcc-native/15).
-_TRITON_CC=""
-for _cand in "${TRITON_CC:-}" /opt/cray/pe/gcc-native/14/bin/gcc gcc; do
-    [ -n "${_cand}" ] || continue
-    if _resolved=$(command -v "${_cand}" 2>/dev/null) && [ -n "${_resolved}" ]; then
-        _TRITON_CC="${_resolved}"
-        break
-    fi
-done
-if [ -n "${_TRITON_CC}" ]; then
-    export CC="${_TRITON_CC}"
-    # Printed on purpose, and it lands in mpiexec.log because common_env.sh is
-    # sourced before launch_role.sh redirects to p.log/d.log. Silent success is
-    # precisely what made this cost an afternoon; one line per rank is cheap.
-    echo "Triton CC override: CC=${CC} (CXX/CUDAHOSTCXX left at nvc++)"
-else
-    echo "WARNING: no gcc found for Triton; leaving CC=${CC:-<unset>}." >&2
-    echo "         If that is nvc++, Triton's cuda_utils build will fail, vLLM" >&2
-    echo "         will silently fall back to recompiling, and the engine will" >&2
-    echo "         hang during startup instead of reporting an error." >&2
-    echo "         Set TRITON_CC=/path/to/gcc to fix." >&2
-fi
-EOF
+source "${SCRIPT_DIR}/emit_common_env.sh"
+emit_common_env "${SHARED}/common_env.sh"
 
 # --no-enable-prefix-caching matters here specifically: without it, if the
 # baseline query (direct-to-D) and the disagg query (via proxy) use the same
@@ -1772,3 +1676,79 @@ echo "  the agent comes up on UCX and everything downstream still returns 200s."
 
 echo ""
 echo "Full logs at: ${SHARED}/logs/"
+
+# =============================================================================
+# KEEP_ALIVE -- hold both servers up so an external client can benchmark them.
+#
+# Everything above is the bring-up evidence chain and runs unchanged. This block
+# only decides whether the script exits (and so tears the servers down) or
+# parks.
+#
+# Why the INT/TERM trap is swapped for the duration of the hold: the standing
+# `trap cleanup EXIT INT TERM` runs cleanup() on SIGINT and then RESUMES, because
+# the handler never exits. During a blocking loop that is the wrong shape twice
+# over -- the loop would keep spinning after the user asked to stop, and when it
+# eventually did fall through, the EXIT trap would run cleanup() a SECOND time.
+# So for the hold we install a handler that only raises a flag, let the loop
+# notice it and fall out, and let the normal EXIT trap do the one teardown. Do
+# not "simplify" this back to a single trap.
+# =============================================================================
+if [ "${KEEP_ALIVE:-0}" = "1" ]; then
+    echo ""
+    echo "============================================================"
+    echo "KEEP_ALIVE=1 -- servers held up. Ctrl-C here is the teardown."
+    echo "============================================================"
+    echo "  Disagg (1P:1D) entry point -- bench this arm:"
+    echo "      http://${P_IP}:${PROXY_PORT}"
+    echo "  Decode server, direct -- the proxy-ceiling control:"
+    echo "      http://${D_IP}:${D_PORT}"
+    echo "  Prefill server, direct:"
+    echo "      http://${P_IP}:${P_PORT}"
+    echo ""
+    echo "  Model string for --model:  ${MODEL}"
+    echo "  Run dir:                   ${SHARED}"
+    echo ""
+    # The proxy-ceiling control is not optional book-keeping -- a single-process
+    # asyncio proxy fronting a 120B disagg pair is the most likely thing to cap
+    # measured throughput, and a cap there looks exactly like "disaggregation
+    # does not help". Benching D directly puts a number on the proxy before the
+    # comparison is drawn, not after someone disputes it.
+    echo "  Bench the proxy AND D-direct. If both arms plateau at the same"
+    echo "  number, the proxy is the ceiling and neither number is about"
+    echo "  disaggregation."
+    echo ""
+
+    _ka_stop=0
+    # shellcheck disable=SC2064
+    trap '_ka_stop=1; echo ""; echo "Interrupt received -- releasing servers."' INT TERM
+
+    _ka_t0=$(date +%s)
+    while [ "${_ka_stop}" -eq 0 ]; do
+        # mpiexec is the liveness source of truth: if PALS tore the application
+        # down, the endpoints above are dead no matter what the last heartbeat
+        # said, and holding the terminal open is just misleading.
+        if ! kill -0 "${MPIEXEC_PID}" 2>/dev/null; then
+            echo ""
+            echo "mpiexec (${MPIEXEC_PID}) exited -- both servers are gone."
+            echo "Check ${SHARED}/logs/mpiexec.log; a PALS-level failure never"
+            echo "reaches p.log or d.log."
+            break
+        fi
+        sleep "${KEEP_ALIVE_POLL_S}"
+        # A bare "still alive" is worth little. Report elapsed time, whether each
+        # server still answers /health, and D's last log line, so a wedged engine
+        # and a busy one stop looking identical from the outside.
+        _ka_el=$(( $(date +%s) - _ka_t0 ))
+        _ka_hp=$(curl -s -o /dev/null -w '%{http_code}' "http://${P_IP}:${P_PORT}/health" 2>/dev/null || echo "---")
+        _ka_hd=$(curl -s -o /dev/null -w '%{http_code}' "http://${D_IP}:${D_PORT}/health" 2>/dev/null || echo "---")
+        printf '  [keep-alive %02d:%02d:%02d] P=%s D=%s | %s\n' \
+            $(( _ka_el / 3600 )) $(( (_ka_el % 3600) / 60 )) $(( _ka_el % 60 )) \
+            "${_ka_hp}" "${_ka_hd}" \
+            "$(tail -n 1 "${SHARED}/logs/d.log" 2>/dev/null | cut -c1-100)"
+    done
+
+    # Restore the original disposition before falling through, so the EXIT trap
+    # is the single teardown path exactly as it is on a KEEP_ALIVE=0 run.
+    trap cleanup EXIT INT TERM
+    echo "Releasing servers -- cleanup() follows."
+fi
