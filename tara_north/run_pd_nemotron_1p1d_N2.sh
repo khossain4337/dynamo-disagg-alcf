@@ -61,6 +61,7 @@ set -uo pipefail
 #   EXPERT_PARALLEL=1 bash run_pd_nemotron_1p1d_N2.sh  # EP instead of TP for MoE
 #   MAX_MODEL_LEN=131072 bash run_pd_nemotron_1p1d_N2.sh
 #   PROMPT_REPEAT=4000 bash run_pd_nemotron_1p1d_N2.sh # past the ~10k crossover
+#   KEEP_ALIVE=0 bash run_pd_nemotron_1p1d_N2.sh       # bring up, verify, tear down
 #
 # PREREQUISITE: the weights must already be in the shared HF cache. 247 GB does
 # not download inside a health-check window; the run will time out, cleanup()
@@ -424,10 +425,14 @@ MAMBA_STATE_BYTES_PER_SEQ_PER_RANK=${MAMBA_STATE_BYTES_PER_SEQ_PER_RANK:-4270000
 HEALTH_TRIES=${HEALTH_TRIES:-360}     # x5s = 30 min
 
 # --- KEEP_ALIVE: hold the servers up for an external bench client -------------
-# Default 0 preserves the historical behaviour exactly: run the Q-checks, fall
-# off the end, EXIT trap tears both servers down. Set to 1 and the script blocks
-# after the checks instead of exiting, so `vllm bench serve` has something to
-# talk to.
+# Default 1, matching run_colocated_N1.sh. It was 0 through 2026-09-11 to
+# preserve the pre-KEEP_ALIVE behaviour exactly, but every current use of this
+# script is "bring the pair up so bench_arm.sh can hit it", and the asymmetry
+# with the colocated launcher cost an allocation: the Q-checks pass, the script
+# falls off the end, the EXIT trap tears both servers down, and the omission is
+# only visible 40 minutes after launch. KEEP_ALIVE=0 still does the old thing --
+# bring up, run the evidence chain, tear down -- and now says so at startup
+# instead of at the end.
 #
 # It has to BLOCK rather than background-and-exit. mpiexec is a child of this
 # shell (MPIEXEC_PID), and PALS ties the application's lifetime to the launcher:
@@ -435,11 +440,19 @@ HEALTH_TRIES=${HEALTH_TRIES:-360}     # x5s = 30 min
 # and even suppressing the trap would leave mpiexec orphaned with no parent to
 # signal it. Blocking in the foreground keeps the process tree intact and makes
 # Ctrl-C (INT -> the same trap) the intended teardown path.
-KEEP_ALIVE=${KEEP_ALIVE:-0}
+KEEP_ALIVE=${KEEP_ALIVE:-1}
 # Heartbeat interval for the hold loop. A silent terminal for an hour is
 # indistinguishable from a dead one, which is the same complaint the deferred
 # wait_healthy heartbeat exists to fix; do not set this to 0.
 KEEP_ALIVE_POLL_S=${KEEP_ALIVE_POLL_S:-60}
+
+# Say it now, not after the weights have loaded. A teardown run and a hold run
+# look identical for the first 40 minutes.
+if [ "${KEEP_ALIVE}" != "1" ]; then
+    echo "=== KEEP_ALIVE=0 -- both servers get TORN DOWN after the Q-checks ==="
+    echo "    Nothing will be left to benchmark. Ctrl-C now and relaunch with"
+    echo "    KEEP_ALIVE=1 if you meant to hold them up."
+fi
 
 # --- Resolve the two allocated nodes -----------------------------------------
 cat ${PBS_NODEFILE}

@@ -190,12 +190,13 @@ MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
 # delta reported, since a real colocated deployment would never set DS.
 SSM_CONV_STATE_LAYOUT=${SSM_CONV_STATE_LAYOUT:-DS}
 
-# --- KEEP_ALIVE: defaults to 1 here, unlike the disagg script ----------------
-# The disagg launcher defaults to 0 because it has a whole bring-up evidence
-# chain to run and holding the servers up is the exception. This script has no
-# evidence chain -- holding a server up for bench_arm.sh is the ONLY thing it
-# does -- so 0 would make the default invocation useless. KEEP_ALIVE=0 is still
-# supported and does the sensible thing: bring up, confirm healthy, tear down.
+# --- KEEP_ALIVE: defaults to 1, same as the disagg script --------------------
+# Holding a server up for bench_arm.sh is the ONLY thing this script does, so 0
+# would make the default invocation useless. The disagg launcher defaulted to 0
+# until 2026-09-11 -- it has a bring-up evidence chain and holding the pair up
+# was framed as the exception -- but the asymmetry between the two launchers
+# cost an allocation, so both now default to 1. KEEP_ALIVE=0 is still supported
+# and does the sensible thing: bring up, confirm healthy, tear down.
 KEEP_ALIVE=${KEEP_ALIVE:-1}
 KEEP_ALIVE_POLL_S=${KEEP_ALIVE_POLL_S:-60}
 HEALTH_TRIES=${HEALTH_TRIES:-360}   # x5s = 30 min; a 240 GB cold load is slow
