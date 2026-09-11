@@ -51,8 +51,37 @@ MAX_CONCURRENCY=${MAX_CONCURRENCY:-32}
 # thrown-away run. Set WARMUP_PROMPTS=0 only to measure the compile itself.
 WARMUP_PROMPTS=${WARMUP_PROMPTS:-${MAX_CONCURRENCY}}
 
-OUT_DIR=${OUT_DIR:-./bench_$(date +%Y%m%d_%H%M%S)_${ARM}}
+# --- Where results land -------------------------------------------------------
+# NOT the current directory. This script is run from the checkout, and results
+# written relative to $PWD land in the repo -- untracked clutter at best, and
+# a 128k-context sweep's result.json committed by accident at worst. Measurement
+# output belongs on /vast next to the run that produced it, on a filesystem both
+# nodes mount.
+#
+# RUN_DIR is the launcher's ${SHARED} -- the KEEP_ALIVE banner prints it as
+# "Run dir:". Set it and the bench is filed with the servers it measured,
+# alongside p.log, d.log and provenance.txt, which is what makes a result
+# reconstructable six weeks later. Without it, benches collect under
+# ${RUNS_ROOT}/bench/ and you have to match them up by timestamp.
+RUNS_ROOT=${RUNS_ROOT:-/vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS}
+if [ -n "${RUN_DIR:-}" ]; then
+    OUT_DIR=${OUT_DIR:-${RUN_DIR}/bench/$(date +%Y%m%d_%H%M%S)_${ARM}}
+else
+    OUT_DIR=${OUT_DIR:-${RUNS_ROOT}/bench/$(date +%Y%m%d_%H%M%S)_${ARM}}
+fi
+
+# Refuse to write into a git work tree even if OUT_DIR was set explicitly.
+_out_parent=$(dirname "${OUT_DIR}")
+mkdir -p "${_out_parent}" || { echo "FATAL: cannot create ${_out_parent}" >&2; exit 1; }
+_out_parent=$(cd "${_out_parent}" && pwd)
+if git -C "${_out_parent}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "FATAL: ${OUT_DIR} is inside a git work tree (${_out_parent})." >&2
+    echo "  Bench output does not belong in the repo. Set RUN_DIR to the" >&2
+    echo "  launcher's run directory, or OUT_DIR to somewhere under /vast." >&2
+    exit 1
+fi
 mkdir -p "${OUT_DIR}"
+OUT_DIR=$(cd "${OUT_DIR}" && pwd)
 
 echo "=== bench_arm: ${ARM} ==="
 echo "  endpoint    ${BASE_URL}"
@@ -142,6 +171,7 @@ run_bench() {
         --random-input-len "${ISL}" \
         --random-output-len "${OSL}" \
         --ignore-eos \
+        --temperature 0 \
         --num-prompts "${n}" \
         --max-concurrency "${MAX_CONCURRENCY}" \
         --percentile-metrics ttft,tpot,itl,e2el \
