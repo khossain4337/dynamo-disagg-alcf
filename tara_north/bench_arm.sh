@@ -65,14 +65,32 @@ echo ""
 # --- Preflight ----------------------------------------------------------------
 # Fail here rather than 40 minutes in. A dead endpoint and a slow one look the
 # same to a bench client that has already started its clock.
-if ! curl -sf -o /dev/null --max-time 10 "${BASE_URL}/health" 2>/dev/null; then
-    # The proxy may not implement /health; fall back to the models list, which
-    # every OpenAI-compatible front end serves.
-    if ! curl -sf -o /dev/null --max-time 10 "${BASE_URL}/v1/models" 2>/dev/null; then
-        echo "FATAL: ${BASE_URL} answers neither /health nor /v1/models." >&2
-        exit 1
-    fi
+#
+# The probe is a real one-token completion, NOT /health or /v1/models. The
+# disagg arm is driven through toy_proxy_server.py, which implements
+# /v1/completions and /v1/chat/completions and nothing else -- probing for a
+# sidecar endpoint failed the disagg arm while the servers were perfectly
+# healthy. A completion is also the stronger test: on the proxy it forces a
+# full P prefill -> NIXL pull -> D decode round trip, so a fabric fault surfaces
+# here instead of as a mysterious first-request outlier in the p99.
+#
+# This runs BEFORE snapshot_metrics, so the probe's own tokens are outside the
+# measured diff.
+_probe=$(curl -s -S --max-time 120 -X POST "${BASE_URL}/v1/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${MODEL}\",\"prompt\":\"ping\",\"max_tokens\":1,\"temperature\":0}" 2>&1)
+if ! printf '%s' "${_probe}" | grep -q '"choices"'; then
+    echo "FATAL: ${BASE_URL} did not answer a one-token completion." >&2
+    echo "  model: ${MODEL}" >&2
+    printf '%s\n' "${_probe}" | head -c 800 >&2
+    echo "" >&2
+    echo "  A 404 here means the front end does not serve /v1/completions." >&2
+    echo "  An empty reply means nothing is listening on that host:port --" >&2
+    echo "  check you are on the HSN (these are get_hsn_ip addresses) and that" >&2
+    echo "  no_proxy covers them; a login-node shell needs curl --noproxy '*'." >&2
+    exit 1
 fi
+echo "  preflight   one-token completion OK"
 
 # --- Config fingerprint -------------------------------------------------------
 # The comparison is only valid if the two arms differ ONLY in the P/D split and
