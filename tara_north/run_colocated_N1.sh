@@ -82,6 +82,10 @@ PREFIX_CACHING_FLAG=${PREFIX_CACHING_FLAG:---no-enable-prefix-caching}
 BLOCK_SIZE=${BLOCK_SIZE:-}
 EXPERT_PARALLEL=${EXPERT_PARALLEL:-}
 ENFORCE_EAGER=${ENFORCE_EAGER:-}
+# Frontend process count. Locked like the rest: the arm that runs one API server
+# against a 32k prompt is measuring its own tokenizer, so a value set on one arm
+# and not the other invalidates the comparison rather than tilting it.
+API_SERVER_COUNT=${API_SERVER_COUNT:-}
 
 # --- MAX_MODEL_LEN: defaults to the disagg script's default ON PURPOSE -------
 # 32768, matching run_pd_nemotron_1p1d_N2.sh:262, so that running both arms
@@ -415,6 +419,7 @@ EXTRA=()
 [ -n "${BLOCK_SIZE}" ]      && EXTRA+=(--block-size ${BLOCK_SIZE})
 [ -n "${EXPERT_PARALLEL}" ] && EXTRA+=(--enable-expert-parallel)
 [ -n "${ENFORCE_EAGER}" ]   && EXTRA+=(--enforce-eager)
+[ -n "${API_SERVER_COUNT}" ] && EXTRA+=(--api-server-count ${API_SERVER_COUNT})
 
 exec vllm serve ${MODEL} --host 0.0.0.0 --port ${PORT} \\
     --tensor-parallel-size ${TP} \\
@@ -440,6 +445,7 @@ chmod +x "${SHARED}/launch_colocated.sh"
     echo "max-model-len    ${MAX_MODEL_LEN}"
     echo "provisioned for  ${WORKLOAD}  (ISL ${WL_ISL} / OSL ${WL_OSL}, needs ${WL_MAX_MODEL_LEN})"
     echo "batching         ${MAX_NUM_BATCHED_TOKENS} tok / ${MAX_NUM_SEQS} seq  (per-knob max of P 16384/32 and D 2048/256)"
+    echo "api servers      ${API_SERVER_COUNT:-1 (vLLM default)}   must match the disagg arm"
     echo "conv layout      ${SSM_CONV_STATE_LAYOUT}   kv ${KV_CACHE_DTYPE}   ssm ${MAMBA_SSM_CACHE_DTYPE}"
     echo "shim             ${SHIM}  sha256 $(sha256sum "${SHIM}" 2>/dev/null | awk '{print $1}')"
     echo "git              $(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || echo '(not a work tree)')"
@@ -612,6 +618,18 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
     # "unchanged since the last poll" is a direct read on whether work is
     # moving -- which /health cannot give, because the API server is a separate
     # process from EngineCore and answers 200 long after the engine has stopped.
+    #
+    # What an EMPTY line means depends on API_SERVER_COUNT. At 1 it means the
+    # engine has nothing to do. Above 1 vLLM disables the stats logger outright
+    # (loggers.py:1341), so the line is absent whatever the engine is doing and
+    # this heartbeat has no engine watchpoint at all -- it must say so, because
+    # "idle" would be a claim the run is no longer in a position to make.
+    if [ -n "${API_SERVER_COUNT}" ] && [ "${API_SERVER_COUNT}" -gt 1 ]; then
+        _KA_NO_ENG="<no engine line: stats logging is off at --api-server-count ${API_SERVER_COUNT}; scrape /metrics to tell idle from stuck>"
+    else
+        _KA_NO_ENG="<idle -- no requests yet; the server is up, health says so>"
+    fi
+
     _ka_last=""
     _ka_stall=0
     _ka_t0=$(date +%s)
@@ -630,7 +648,7 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
         printf '  [keep-alive %02d:%02d:%02d] health=%s | %s\n' \
             $(( _ka_el / 3600 )) $(( (_ka_el % 3600) / 60 )) $(( _ka_el % 60 )) \
             "${_ka_h}" \
-            "${_ka_eng:-<idle -- no requests yet; the server is up, health says so>}"
+            "${_ka_eng:-${_KA_NO_ENG}}"
 
         # An engine with nothing to do also stops logging, and that is NOT a
         # stall -- it is the normal state between benches, which is most of what

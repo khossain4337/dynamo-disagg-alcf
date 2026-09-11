@@ -307,6 +307,36 @@ EXPERT_PARALLEL=${EXPERT_PARALLEL:-}
 # problem or a transfer problem", not for any run whose numbers get quoted.
 ENFORCE_EAGER=${ENFORCE_EAGER:-}
 
+# OFF by default, and the only knob here that tunes the SERVER rather than the
+# model. vLLM's frontend does per-request work proportional to prompt length --
+# tokenization, the OpenAI request object, SSE assembly -- in one asyncio
+# process. At ISL 32,768 that process, not the engine, is the ceiling: in the
+# 2026-09-11 disagg run P's engine was busy 128.29 s of a 1,034 s wall clock,
+# 12.4%, while prefilling at the same 16k tok/s the colocated pilot managed.
+# --api-server-count N runs N frontend processes behind one SO_REUSEPORT socket
+# against the same engine core. Start at 4.
+#
+# Present in this build: cli_args.py:379, alias -asc, default data_parallel_size
+# (= 1 here). It is refused with --headless, the rust frontend, elastic EP and
+# runtime LoRA updating, none of which are used here, and it does NOT interact
+# with --kv-transfer-config -- the connector lives in the engine and worker
+# processes, and the frontend never instantiates one.
+#
+# Two things change when it is > 1, both expected and neither a fault:
+#   - vLLM switches Prometheus to multiprocess mode by itself (serve.py:274) and
+#     /metrics returns the aggregate, so every histogram scrape keeps working
+#     unchanged. Counters and histograms sum across the frontends; the scheduler
+#     gauges are declared "mostrecent", which is the right answer because they
+#     are whole-engine values that one frontend writes per step.
+#   - the periodic `Engine 000: Running: N reqs` line is DISABLED outright
+#     (loggers.py:1341, "disabling stats logging to avoid incomplete stats").
+#     The keep-alive heartbeat below therefore loses its engine watchpoint, and
+#     says so rather than reporting a false idle.
+#
+# Set it to the SAME value on both roles and on both arms. Applied to one arm
+# only, it measures the frontend and calls the result disaggregation.
+API_SERVER_COUNT=${API_SERVER_COUNT:-}
+
 # --- ASYMMETRIC (P and D are different workloads) ----------------------------
 #
 # This is the part worth sweeping, and the part that makes disaggregation pay.
@@ -559,6 +589,7 @@ fi
     echo "built:     $(date -r "${SHIM}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
     echo "env:       ${ENV_SCRIPT}"
     echo "env md5:   $(md5sum "${ENV_SCRIPT}" 2>/dev/null | awk '{print $1}')"
+    echo "api srv:   ${API_SERVER_COUNT:-1 (vLLM default)}  (both roles; must match the colocated arm)"
 } | tee ${SHARED}/provenance.txt
 echo "Shim OK (PATCH 2/3/4 markers present), visible from ${NODE_D}."
 
@@ -786,6 +817,7 @@ EXTRA=()
 [ -n "${BLOCK_SIZE}" ]      && EXTRA+=(--block-size ${BLOCK_SIZE})
 [ -n "${EXPERT_PARALLEL}" ] && EXTRA+=(--enable-expert-parallel)
 [ -n "${ENFORCE_EAGER}" ]   && EXTRA+=(--enforce-eager)
+[ -n "${API_SERVER_COUNT}" ] && EXTRA+=(--api-server-count ${API_SERVER_COUNT})
 
 exec vllm serve ${MODEL} --host 0.0.0.0 --port \${PORT} \\
     --tensor-parallel-size ${TP} \\
@@ -807,6 +839,7 @@ echo "Tensor parallel size:      ${TP} (both roles), gpu-memory-utilization ${GP
 echo "Context / caches:          max-model-len ${MAX_MODEL_LEN}, kv ${KV_CACHE_DTYPE}, ssm ${MAMBA_SSM_CACHE_DTYPE}, conv layout ${SSM_CONV_STATE_LAYOUT}"
 echo "Batching (asymmetric):     P ${P_MAX_NUM_BATCHED_TOKENS} tok / ${P_MAX_NUM_SEQS} seq   D ${D_MAX_NUM_BATCHED_TOKENS} tok / ${D_MAX_NUM_SEQS} seq"
 echo "Optional:                  block-size '${BLOCK_SIZE:-<derived>}', expert-parallel '${EXPERT_PARALLEL:-off}', enforce-eager '${ENFORCE_EAGER:-off}'"
+echo "API server processes:      ${API_SERVER_COUNT:-1 (vLLM default)} -- must match the other arm"
 
 # --- Launch both, from ONE application so they share a VNI -------------------
 # -ppn 1 with 2 nodes puts exactly one server on each. Rank-to-node assignment
@@ -1767,6 +1800,17 @@ if [ "${KEEP_ALIVE:-0}" = "1" ]; then
     trap '_ka_stop=1; echo ""; echo "Interrupt received -- releasing servers."' INT TERM
 
     _ka_t0=$(date +%s)
+    # What an empty engine line means depends on API_SERVER_COUNT. At 1 it means
+    # D has nothing to do. Above 1 vLLM disables the stats logger outright
+    # (loggers.py:1341), so the line is absent whatever the engine is doing and
+    # this heartbeat has no engine watchpoint at all -- it must say so, because
+    # "idle" would be a claim the run is no longer in a position to make.
+    if [ -n "${API_SERVER_COUNT}" ] && [ "${API_SERVER_COUNT}" -gt 1 ]; then
+        _KA_NO_ENG="<no engine line: stats logging is off at --api-server-count ${API_SERVER_COUNT}; scrape /metrics to tell idle from stuck>"
+    else
+        _KA_NO_ENG="<D idle -- no requests yet; both servers are up>"
+    fi
+
     while [ "${_ka_stop}" -eq 0 ]; do
         # mpiexec is the liveness source of truth: if PALS tore the application
         # down, the endpoints above are dead no matter what the last heartbeat
@@ -1805,7 +1849,7 @@ if [ "${KEEP_ALIVE:-0}" = "1" ]; then
         printf '  [keep-alive %02d:%02d:%02d] P=%s D=%s | %s\n' \
             $(( _ka_el / 3600 )) $(( (_ka_el % 3600) / 60 )) $(( _ka_el % 60 )) \
             "${_ka_hp}" "${_ka_hd}" \
-            "${_ka_eng:-<D idle -- no requests yet; both servers are up>}"
+            "${_ka_eng:-${_KA_NO_ENG}}"
 
         # An engine with nothing to do also stops logging, and that is NOT a
         # stall -- it is the normal state between benches. Only an unchanged
