@@ -24,45 +24,71 @@ set -uo pipefail
 # be scraped from the engines directly while traffic goes through the front door.
 # =============================================================================
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 ARM=${ARM:?set ARM to a label, e.g. disagg|colocated|d-direct}
 BASE_URL=${BASE_URL:?set BASE_URL to the endpoint under test}
 METRICS_URLS=${METRICS_URLS:-${BASE_URL}}
 MODEL=${MODEL:-nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16}
 
 # --- Locked workload. Do not vary these between arms. -------------------------
-# (128k, 8k) was chosen because prefill pressure per output token is ISL/OSL:
-# at ratio 16 the decode stream sees 16x the prefill interference ShareGPT's
-# ~1.7 produces, while OSL stays long enough that ITL is what the user actually
-# experiences. See MEMORY_2026-09-10.md.
-ISL=${ISL:-131072}
-OSL=${OSL:-8192}
-NUM_PROMPTS=${NUM_PROMPTS:-128}
+# The numbers, and the argument for each, live in workload_profile.sh -- the ONE
+# copy, shared with run_colocated_N1.sh, which needs the matching
+# --max-model-len at server launch hours before this script runs. See the header
+# of that file for why it is not inlined here.
+#
+# WORKLOAD selects the point; individual variables still override it:
+#
+#     WORKLOAD=floor32k  ...  bash bench_arm.sh    # handoff item 1
+#     WORKLOAD=iter32k MAX_CONCURRENCY=64 ...      # a point on the goodput curve
+#
+# The default stays pilot128k. iter32k is NOT the default until floor128k and
+# floor32k have been run and agree to within ~10% -- that pair is the gate on
+# whether the small workload is ratio-equivalent or merely cheaper.
+WORKLOAD=${WORKLOAD:-pilot128k}
+# shellcheck source=workload_profile.sh
+source "${SCRIPT_DIR}/workload_profile.sh"
+load_workload_profile "${WORKLOAD}" || exit 1
+
+ISL=${ISL:-${WL_ISL}}
+OSL=${OSL:-${WL_OSL}}
+NUM_PROMPTS=${NUM_PROMPTS:-${WL_NUM_PROMPTS}}
 # Client-side offered load, and the knob that actually controls concurrency.
 # --max-num-seqs is a server-side CAP, but it is NOT the binding one: KV is.
-#
-# MEASURED on the colocated arm 2026-09-11 (run colocated_tp4_20260911_052433),
-# TP=4, gpu-memory-utilization 0.90, MAX_MODEL_LEN=139264:
-#     Available KV cache memory:  23.43 GiB per rank   (NOT the ~48 GB the
-#                                 launcher comments estimate -- weights plus
-#                                 non-torch came to 58.7-60.7 GiB, peak
-#                                 activation 3.35 GiB, cudagraph pool 0.89 GiB)
-#     GPU KV cache size:          5,222,400 tokens
-#     Maximum concurrency for 139,264 tokens per request:  37.50x
-#
-# So ~37 is the hard ceiling at this ISL on 4 GPUs, and it applies to the disagg
-# arm too -- D holds the same sequences' KV on the same 4 GPUs. Any Figure 2
-# concurrency sweep has to live below it in BOTH arms.
-#
+# Measured pool 2026-09-11 (run colocated_tp4_20260911_052433), TP=4,
+# gpu-memory-utilization 0.90: 23.43 GiB of KV per rank, 5,222,400 tokens. That
+# is 37.50x at 139,264 tokens/request and 150.0x at 34,816 -- and it binds the
+# disagg arm identically, because D holds the same sequences on the same 4 GPUs.
 # Leaving this unset makes p95 TTFT a measurement of the queue, not of prefill.
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-32}
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-${WL_MAX_CONCURRENCY}}
+
+# --- SLOs -- profile-supplied, because they do NOT survive a change of ISL ----
+# Figure 2 is SLO-constrained goodput: the max rate meeting a p95 ITL target,
+# divided by GPU count. That makes the SLO part of the workload definition, not
+# a note in a doc. The TTFT bar in particular has to be re-derived whenever ISL
+# moves -- an 8 s bar against a 1.6 s prefill never binds, and a non-binding SLO
+# silently turns goodput back into raw throughput, which is the comparison
+# disagg is already known to lose (MEMORY_2026-09-10.md).
+SLO_TTFT_MS=${SLO_TTFT_MS:-${WL_SLO_TTFT_MS}}
+SLO_ITL_P95_MS=${SLO_ITL_P95_MS:-${WL_SLO_ITL_P95_MS}}
+# For the per-GPU normalization. The blog's Figure 2 normalizes throughput per
+# GPU, which is what lets a 4-GPU colocated arm be compared with an 8-GPU
+# disagg one at all (CLOSED.md).
+case "${ARM}" in
+    disagg) GPUS=${GPUS:-8} ;;      # 1P + 1D, TP=4 each
+    *)      GPUS=${GPUS:-4} ;;      # colocated, or D benched directly
+esac
 
 # --- Warmup ------------------------------------------------------------------
 # jit_monitor warns that Triton compiles _causal_conv1d_fwd_kernel and
 # fused_moe_kernel DURING inference. Those compiles land in the first requests
 # of any sweep and go straight into the p99 that this comparison turns on.
 # vllm bench serve has no warmup-discard of its own, so it is a separate,
-# thrown-away run. Set WARMUP_PROMPTS=0 only to measure the compile itself.
-WARMUP_PROMPTS=${WARMUP_PROMPTS:-${MAX_CONCURRENCY}}
+# thrown-away run. Set WARMUP_PROMPTS=0 only to measure the compile itself --
+# which is what the floor* profiles do, deliberately: handoff item 1 wants the
+# uncontended floor on a server that is already warm from a previous run, and a
+# warmup would be most of the 15 seconds the measurement is supposed to cost.
+WARMUP_PROMPTS=${WARMUP_PROMPTS:-${WL_WARMUP_PROMPTS}}
 #
 # The warmup runs at the FULL ISL but a SHORT OSL, and the asymmetry is
 # deliberate. Kernel selection is a function of shape, and the shapes that
@@ -79,7 +105,7 @@ WARMUP_PROMPTS=${WARMUP_PROMPTS:-${MAX_CONCURRENCY}}
 # 128 is enough to (a) drain every prefill, (b) reach a pure-decode batch, and
 # (c) let requests actually COMPLETE and release their KV -- which is itself a
 # test the 8192 warmup never got far enough to perform.
-WARMUP_OSL=${WARMUP_OSL:-128}
+WARMUP_OSL=${WARMUP_OSL:-${WL_WARMUP_OSL}}
 
 # --- Where results land -------------------------------------------------------
 # NOT the current directory. This script is run from the checkout, and results
@@ -116,8 +142,28 @@ OUT_DIR=$(cd "${OUT_DIR}" && pwd)
 echo "=== bench_arm: ${ARM} ==="
 echo "  endpoint    ${BASE_URL}"
 echo "  metrics     ${METRICS_URLS}"
+echo "  profile     ${WORKLOAD}  (${WL_DESC})"
 echo "  workload    ISL=${ISL} OSL=${OSL} n=${NUM_PROMPTS} concurrency=${MAX_CONCURRENCY}"
 echo "  warmup      ${WARMUP_PROMPTS} prompts at OSL=${WARMUP_OSL} (discarded)"
+if [ -n "${SLO_TTFT_MS}" ] || [ -n "${SLO_ITL_P95_MS}" ]; then
+    echo "  SLOs        p95 TTFT <= ${SLO_TTFT_MS:-n/a} ms, p95 ITL <= ${SLO_ITL_P95_MS:-n/a} ms, over ${GPUS} GPUs"
+else
+    echo "  SLOs        none (reference measurement, not a candidate)"
+fi
+# The disagg arm's predicted per-request KV volume, from the closed Figure 1
+# model. Printed so the engine-counter diff below has something to be checked
+# AGAINST rather than merely recorded -- the model is exact to the byte on four
+# measured points, so a mismatch here is a finding, not noise.
+if [ "${ARM}" = "disagg" ]; then
+    _pred_rank=$(workload_transfer_bytes_per_rank "${ISL}")
+    _pred_req=$(( _pred_rank * 4 ))
+    _floor_pct=$(( (42557440 * 100 + _pred_rank / 2) / _pred_rank ))   # rounded, not truncated
+    printf '  transfer    predicted %s B/rank/request, %s B over 4 ranks\n' \
+        "${_pred_rank}" "${_pred_req}"
+    printf '              fixed Mamba floor is %s%% of it (does NOT scale with ISL)\n' \
+        "${_floor_pct}"
+    echo "              expect nixl_bytes_transferred_sum to move by ~$(( _pred_req * NUM_PROMPTS )) B"
+fi
 echo "  out         ${OUT_DIR}"
 echo ""
 
@@ -227,7 +273,9 @@ if [ -n "${_mml}" ]; then
         echo "FATAL: ISL + OSL = ${_need} does not leave headroom under" >&2
         echo "  --max-model-len=${_mml}. Requests will be rejected with HTTP 400" >&2
         echo "  before any KV moves, and a rejected request looks like a fast one." >&2
-        echo "  Relaunch with MAX_MODEL_LEN=$(( (_need + 8192 + 4095) / 4096 * 4096 ))." >&2
+        echo "  Relaunch BOTH arms with the ${WORKLOAD} profile's value:" >&2
+        echo "      MAX_MODEL_LEN=${WL_MAX_MODEL_LEN} bash run_colocated_N1.sh" >&2
+        echo "      MAX_MODEL_LEN=${WL_MAX_MODEL_LEN} bash run_pd_nemotron_1p1d_N2.sh" >&2
         exit 1
     fi
 else
@@ -247,6 +295,7 @@ done
 cat > "${OUT_DIR}/config.json" <<EOF
 {
   "arm": "${ARM}",
+  "workload": "${WORKLOAD}",
   "base_url": "${BASE_URL}",
   "metrics_urls": "${METRICS_URLS}",
   "model": "${MODEL}",
@@ -256,6 +305,9 @@ cat > "${OUT_DIR}/config.json" <<EOF
   "max_concurrency": ${MAX_CONCURRENCY},
   "warmup_prompts": ${WARMUP_PROMPTS},
   "warmup_osl": ${WARMUP_OSL},
+  "slo_ttft_ms": ${SLO_TTFT_MS:-null},
+  "slo_itl_p95_ms": ${SLO_ITL_P95_MS:-null},
+  "gpus": ${GPUS},
   "server_max_model_len": ${_mml:-null},
   "started": "$(date -Is)"
 }
@@ -360,6 +412,93 @@ echo "  truncated or rejected and the percentiles are not comparable across arms
 echo "  num_preemptions_total must stay at 0. Any preemption means the KV budget"
 echo "  was exceeded and you measured recompute, not prefill interference --"
 echo "  lower MAX_CONCURRENCY and re-run."
+
+# --- SLO verdict --------------------------------------------------------------
+# Figure 2 is SLO-constrained goodput: the maximum offered rate that still meets
+# the SLOs, divided by GPU count. A single bench_arm run is ONE point on that
+# curve, and the only question it can answer is whether this point is feasible.
+# Deciding that by eye from a wall of percentiles is how a marginal point gets
+# quoted as a passing one, so it is computed here and recorded next to the run.
+#
+# ADVISORY ONLY -- this never changes the exit code. An infeasible point is a
+# valid measurement (it is how you find the ceiling), not a failed run.
+if [ -f "${OUT_DIR}/result.json" ]; then
+    echo ""
+    OUT_DIR="${OUT_DIR}" WORKLOAD="${WORKLOAD}" GPUS="${GPUS}" \
+    SLO_TTFT_MS="${SLO_TTFT_MS}" SLO_ITL_P95_MS="${SLO_ITL_P95_MS}" \
+    python3 - <<'PY'
+import json, os, sys
+
+out = os.environ["OUT_DIR"]
+try:
+    with open(os.path.join(out, "result.json")) as fh:
+        r = json.load(fh)
+except Exception as e:                        # noqa: BLE001 -- advisory only
+    print(f"  WARN: could not read result.json for the SLO verdict: {e}")
+    sys.exit(0)
+
+# vllm bench serve writes a list of one dict in some versions, a dict in others.
+if isinstance(r, list):
+    r = r[0] if r else {}
+
+g = lambda k: r.get(k)                        # noqa: E731
+gpus = int(os.environ["GPUS"])
+ttft_slo = os.environ.get("SLO_TTFT_MS") or None
+itl_slo = os.environ.get("SLO_ITL_P95_MS") or None
+
+print(f"=== SLO verdict ({os.environ['WORKLOAD']}) ===")
+
+# The reference measurement (floor*) has no SLOs; what it owes is the floor.
+if not ttft_slo and not itl_slo:
+    print("  Reference measurement -- no SLOs. The deliverable is the floor:")
+    for label, key in (("TPOT  mean", "mean_tpot_ms"),
+                       ("ITL   median", "median_itl_ms"),
+                       ("ITL   p95", "p95_itl_ms"),
+                       ("TTFT  mean", "mean_ttft_ms")):
+        v = g(key)
+        print(f"    {label:<14} {v:>9.2f} ms" if isinstance(v, (int, float))
+              else f"    {label:<14} (absent from result.json)")
+    print("  Compare floor128k against floor32k: agreement within ~10% means")
+    print("  decode is weight-bound, the ISL/OSL ratio argument holds, and the")
+    print("  25 ms ITL SLO transfers to the small workload unchanged.")
+    sys.exit(0)
+
+verdict = []
+for label, key, slo in (("p95 TTFT", "p95_ttft_ms", ttft_slo),
+                        ("p95 ITL", "p95_itl_ms", itl_slo)):
+    if slo is None:
+        continue
+    v, slo = g(key), float(slo)
+    if not isinstance(v, (int, float)):
+        print(f"  {label:<9} (absent from result.json) -- cannot judge")
+        verdict.append(None)
+        continue
+    ok = v <= slo
+    verdict.append(ok)
+    print(f"  {label:<9} {v:9.2f} ms  {'<=' if ok else ' >'} {slo:>8.0f} ms   "
+          f"{'PASS' if ok else 'FAIL'}")
+
+# p99 is printed but never gated: at low concurrency the extreme tail is
+# truncated by construction (a 28-chunk-step stall cannot occur when only ~32
+# chunk-steps exist in the whole window), so it is regime-dependent in a way p95
+# is not. Read it, do not put an SLO on it.
+p99 = g("p99_itl_ms")
+if isinstance(p99, (int, float)):
+    print(f"  p99 ITL   {p99:9.2f} ms  (reported, never gated -- see comment)")
+
+thr = g("output_throughput")
+if isinstance(thr, (int, float)):
+    print(f"  output    {thr:9.2f} tok/s total, {thr / gpus:.2f} tok/s/GPU "
+          f"over {gpus} GPUs")
+
+if verdict and all(v is True for v in verdict):
+    print("  FEASIBLE at this rate. Raise MAX_CONCURRENCY and re-run to find the")
+    print("  ceiling -- goodput is the per-GPU number at the HIGHEST feasible rate.")
+elif any(v is False for v in verdict):
+    print("  INFEASIBLE at this rate. This is a valid data point: the previous")
+    print("  feasible concurrency is the goodput, not this one.")
+PY
+fi
 
 echo ""
 echo "Results: ${OUT_DIR}/result.json   (bench_rc=${BENCH_RC})"

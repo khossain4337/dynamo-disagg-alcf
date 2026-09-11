@@ -38,12 +38,30 @@ set -uo pipefail
 # being comparable.
 #
 # USAGE
-#   bash run_colocated_N1.sh                      # 32k context, holds the server
-#   MAX_MODEL_LEN=147456 bash run_colocated_N1.sh # the Figure 2 pilot
-#   KEEP_ALIVE=0 bash run_colocated_N1.sh         # bring up, verify, tear down
+#   bash run_colocated_N1.sh                       # 32k context, holds the server
+#   MAX_MODEL_LEN=147456 bash run_colocated_N1.sh  # the settled Figure 2 point
+#   MAX_MODEL_LEN=43008  bash run_colocated_N1.sh  # the iter32k point
+#   KEEP_ALIVE=0 bash run_colocated_N1.sh          # bring up, verify, tear down
+#
+# WORKLOAD=<profile> does not change --max-model-len (see the block below) but
+# it does tell the guard near the end of this file WHICH workload to check the
+# context budget against, so the advice it prints is the advice you need:
+#
+#   WORKLOAD=iter32k bash run_colocated_N1.sh
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The workload point this server is being provisioned FOR. Read from the same
+# file bench_arm.sh reads, so the context budget set here and the ISL/OSL sent
+# there come from ONE definition. They are decided hours apart, on different
+# nodes, by different commands; when they disagree the symptom is an HTTP 400
+# per request, which is instant and therefore reads on the progress bar as a
+# fast request rather than as a fault (2026-09-11).
+WORKLOAD=${WORKLOAD:-pilot128k}
+# shellcheck source=workload_profile.sh
+source "${SCRIPT_DIR}/workload_profile.sh"
+load_workload_profile "${WORKLOAD}" || exit 1
 
 # =============================================================================
 # LOCKED -- must match run_pd_nemotron_1p1d_N2.sh exactly
@@ -67,12 +85,18 @@ ENFORCE_EAGER=${ENFORCE_EAGER:-}
 
 # --- MAX_MODEL_LEN: defaults to the disagg script's default ON PURPOSE -------
 # 32768, matching run_pd_nemotron_1p1d_N2.sh:262, so that running both arms
-# with no environment at all gives two comparable servers. The Figure 2 pilot
-# needs MORE than 139264 (ISL 131072 + OSL 8192) and that number must be passed
+# with no environment at all gives two comparable servers. Each workload profile
+# carries the value it needs (WL_MAX_MODEL_LEN), and that number must be passed
 # to BOTH arms in the same breath:
 #
-#     MAX_MODEL_LEN=147456 bash run_colocated_N1.sh
+#     MAX_MODEL_LEN=147456 bash run_colocated_N1.sh        # pilot128k
 #     MAX_MODEL_LEN=147456 bash run_pd_nemotron_1p1d_N2.sh
+#
+# It is deliberately NOT defaulted to WL_MAX_MODEL_LEN. The disagg launcher is
+# frozen and cannot learn about profiles, so defaulting this one would make the
+# two arms differ when both are run bare -- exactly the failure this block
+# exists to prevent. The profile informs the guard, it does not silently move
+# the server. The guard at the end of this file prints the right number.
 #
 # 147456, not 139264, and the 8192 of slack is not superstition. Setting it to
 # exactly ISL+OSL was tried on 2026-09-11 and one warmup request still came back
@@ -413,6 +437,7 @@ chmod +x "${SHARED}/launch_colocated.sh"
     echo "model            ${MODEL}"
     echo "tp               ${TP}   gpu-memory-utilization ${GPU_MEM_UTIL}"
     echo "max-model-len    ${MAX_MODEL_LEN}"
+    echo "provisioned for  ${WORKLOAD}  (ISL ${WL_ISL} / OSL ${WL_OSL}, needs ${WL_MAX_MODEL_LEN})"
     echo "batching         ${MAX_NUM_BATCHED_TOKENS} tok / ${MAX_NUM_SEQS} seq  (per-knob max of P 16384/32 and D 2048/256)"
     echo "conv layout      ${SSM_CONV_STATE_LAYOUT}   kv ${KV_CACHE_DTYPE}   ssm ${MAMBA_SSM_CACHE_DTYPE}"
     echo "shim             ${SHIM}  sha256 $(sha256sum "${SHIM}" 2>/dev/null | awk '{print $1}')"
@@ -421,21 +446,29 @@ chmod +x "${SHARED}/launch_colocated.sh"
 cat "${SHARED}/run_config.txt"
 
 # --- The workload guard that handoff item 2 exists to fix --------------------
-# ISL 131072 + OSL 8192 = 139264, and the guard wants STRICTLY more than that.
-# At exactly 139264 the random dataset's prompt-length jitter still produced an
-# HTTP 400 on 2026-09-11 (see the MAX_MODEL_LEN block above). Below the bar,
-# requests come back 400 before a single token is processed -- instantly, which
-# is why it reads as a fast request rather than as a harness fault.
-_PILOT_CTX=147456
-if [ "${MAX_MODEL_LEN}" -lt "${_PILOT_CTX}" ]; then
+# The bar is the selected profile's WL_MAX_MODEL_LEN: ISL + OSL plus 8192 of
+# slack, and the guard wants at least that. Slack, not an exact fit, because
+# `vllm bench serve --dataset-name random` synthesises prompts NEAR
+# --random-input-len rather than on it, so a budget of exactly ISL+OSL rejects
+# whichever prompts round up -- tried on 2026-09-11, one warmup request still
+# came back HTTP 400. Below the bar requests are rejected before a single token
+# is processed, instantly, which is why it reads as a fast request rather than
+# as a harness fault.
+#
+# Raising --max-model-len is close to free: it sizes the per-request position
+# budget, not the KV pool, which comes from --gpu-memory-utilization. The one
+# thing it does change is cosmetic and easy to misread -- vLLM's startup line
+# "Maximum concurrency for N tokens per request" divides the pool by
+# max-model-len, not by the ISL you will actually send.
+if [ "${MAX_MODEL_LEN}" -lt "${WL_MAX_MODEL_LEN}" ]; then
     echo ""
-    echo "NOTE: max-model-len ${MAX_MODEL_LEN} < ${_PILOT_CTX}, so the settled Figure 2"
-    echo "      workload (ISL 131072 / OSL 8192, plus dataset jitter) risks being"
-    echo "      REJECTED with HTTP 400."
-    echo "      Fine for a smoke run. For the pilot, pass it to BOTH arms:"
-    echo "          MAX_MODEL_LEN=${_PILOT_CTX} bash run_colocated_N1.sh"
-    echo "          MAX_MODEL_LEN=${_PILOT_CTX} bash run_pd_nemotron_1p1d_N2.sh"
-    echo "      and confirm the model really serves ${_PILOT_CTX} positions --"
+    echo "NOTE: max-model-len ${MAX_MODEL_LEN} < ${WL_MAX_MODEL_LEN}, so the ${WORKLOAD}"
+    echo "      workload (ISL ${WL_ISL} / OSL ${WL_OSL}, plus dataset jitter) risks"
+    echo "      being REJECTED with HTTP 400."
+    echo "      Fine for a smoke run. To bench it, pass it to BOTH arms:"
+    echo "          MAX_MODEL_LEN=${WL_MAX_MODEL_LEN} bash run_colocated_N1.sh"
+    echo "          MAX_MODEL_LEN=${WL_MAX_MODEL_LEN} bash run_pd_nemotron_1p1d_N2.sh"
+    echo "      and confirm the model really serves ${WL_MAX_MODEL_LEN} positions --"
     echo "      config.json declaring 262144 is a claim, not a measurement."
 fi
 
