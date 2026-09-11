@@ -1707,6 +1707,37 @@ if [ "${KEEP_ALIVE:-0}" = "1" ]; then
     echo ""
     echo "  Model string for --model:  ${MODEL}"
     echo "  Run dir:                   ${SHARED}"
+    echo "  max-model-len:             ${MAX_MODEL_LEN}"
+    echo ""
+    # Print the invocations rather than the endpoints alone. Reconstructing them
+    # from memory is how 2026-09-11 got benched against the PREVIOUS run's IP
+    # from a shell that had never sourced common_env.sh -- two mistakes that
+    # both surface as a Squid error page and read as a dead server.
+    echo "  From another shell, on either node:"
+    echo ""
+    echo "      source ${SHARED}/common_env.sh"
+    echo ""
+    echo "      # the disagg arm, through the proxy"
+    echo "      ARM=disagg \\"
+    echo "      BASE_URL=http://${P_IP}:${PROXY_PORT} \\"
+    echo "      METRICS_URLS=http://${P_IP}:${P_PORT},http://${D_IP}:${D_PORT} \\"
+    echo "      RUN_DIR=${SHARED} \\"
+    echo "          bash ${SCRIPT_DIR}/bench_arm.sh"
+    echo ""
+    echo "      # the proxy-ceiling control, D direct"
+    echo "      ARM=d-direct \\"
+    echo "      BASE_URL=http://${D_IP}:${D_PORT} \\"
+    echo "      METRICS_URLS=http://${D_IP}:${D_PORT} \\"
+    echo "      RUN_DIR=${SHARED} \\"
+    echo "          bash ${SCRIPT_DIR}/bench_arm.sh"
+    echo ""
+    echo "  METRICS_URLS points at P and D directly because the proxy serves no"
+    echo "  /metrics (CLOSED.md). The source line is NOT optional: without it a"
+    echo "  fresh shell has no conda env, no HF_HOME/HF_TOKEN for the tokenizer,"
+    echo "  and no no_proxy for these HSN addresses -- so curl reaches"
+    echo "  proxy.alcf.anl.gov and every failure looks like a dead server."
+    echo "  Take these addresses from THIS banner; no_proxy is generated per run,"
+    echo "  so an IP from an earlier allocation is never in it."
     echo ""
     # The proxy-ceiling control is not optional book-keeping -- a single-process
     # asyncio proxy fronting a 120B disagg pair is the most likely thing to cap
@@ -1736,15 +1767,59 @@ if [ "${KEEP_ALIVE:-0}" = "1" ]; then
         fi
         sleep "${KEEP_ALIVE_POLL_S}"
         # A bare "still alive" is worth little. Report elapsed time, whether each
-        # server still answers /health, and D's last log line, so a wedged engine
+        # server still answers /health, and D's ENGINE line, so a wedged engine
         # and a busy one stop looking identical from the outside.
+        #
+        # Not `tail -n 1 d.log`. That was reporting this loop's own /health probe
+        # back to itself -- the access-log entry is almost always the last line,
+        # because the loop writes one every KEEP_ALIVE_POLL_S. On 2026-09-11 the
+        # colocated arm printed `health=200` once a minute for twelve minutes
+        # while the engine behind it had not stepped once.
+        #
+        # /health cannot substitute: APIServer is a separate process from
+        # EngineCore and keeps answering 200 long after the engine has stopped.
+        # loggers.py:310 is the engine's own periodic stats line -- it advances
+        # about every 10 s while work is in flight and stops the instant it is
+        # not, which is the signal we actually want.
+        #
+        # D is the right single watchpoint for BOTH failure directions: if P
+        # wedges, D starves and its line freezes too.
         _ka_el=$(( $(date +%s) - _ka_t0 ))
         _ka_hp=$(curl -s -o /dev/null -w '%{http_code}' "http://${P_IP}:${P_PORT}/health" 2>/dev/null || echo "---")
         _ka_hd=$(curl -s -o /dev/null -w '%{http_code}' "http://${D_IP}:${D_PORT}/health" 2>/dev/null || echo "---")
+        _ka_eng=$(grep -F 'loggers.py:310' "${SHARED}/logs/d.log" 2>/dev/null | tail -n 1 \
+                    | sed 's/.*Engine 000: //' | cut -c1-100)
         printf '  [keep-alive %02d:%02d:%02d] P=%s D=%s | %s\n' \
             $(( _ka_el / 3600 )) $(( (_ka_el % 3600) / 60 )) $(( _ka_el % 60 )) \
             "${_ka_hp}" "${_ka_hd}" \
-            "$(tail -n 1 "${SHARED}/logs/d.log" 2>/dev/null | cut -c1-100)"
+            "${_ka_eng:-<D idle -- no requests yet; both servers are up>}"
+
+        # An engine with nothing to do also stops logging, and that is NOT a
+        # stall -- it is the normal state between benches. Only an unchanged
+        # line that still claims in-flight work is evidence of a wedge.
+        case "${_ka_eng}" in
+            ""|*"Running: 0 reqs, Waiting: 0 reqs"*) _ka_busy=0 ;;
+            *)                                       _ka_busy=1 ;;
+        esac
+        if [ "${_ka_busy}" -eq 1 ] && [ "${_ka_eng}" = "${_ka_last:-}" ]; then
+            _ka_stall=$(( ${_ka_stall:-0} + 1 ))
+        else
+            _ka_stall=0
+        fi
+        _ka_last=${_ka_eng}
+
+        # Two identical polls is >=2*KEEP_ALIVE_POLL_S with no engine step,
+        # against a line that normally advances every 10 s. Not slowness.
+        if [ "${_ka_stall}" -ge 2 ]; then
+            echo "      ^^ STALLED: no D engine step in $(( _ka_stall * KEEP_ALIVE_POLL_S ))s."
+            echo "         health=200 proves nothing -- APIServer is a separate pid."
+            echo "         Capture the stacks BEFORE Ctrl-C, or the cause dies with it:"
+            echo "             pgrep -a -f 'EngineCore|VLLM::Worker_TP'"
+            echo "             py-spy dump --pid <EngineCore pid>"
+            echo "             py-spy dump --pid <Worker_TP0 pid>"
+            echo "         Do this on BOTH nodes -- a stalled D can be a starved D."
+            echo "         Then nvidia-smi, then Ctrl-C."
+        fi
     done
 
     # Restore the original disposition before falling through, so the EXIT trap

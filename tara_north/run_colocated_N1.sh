@@ -497,12 +497,29 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
     echo ""
     echo "  Model string for --model:  ${MODEL}"
     echo "  Run dir:                   ${SHARED}"
+    echo "  max-model-len:             ${MAX_MODEL_LEN}"
     echo ""
-    echo "  From another shell:"
+    echo "  From another shell, ON THIS NODE (${THIS_HOST}):"
+    echo ""
+    echo "      source ${SHARED}/common_env.sh"
+    echo ""
     echo "      ARM=colocated \\"
     echo "      BASE_URL=http://${IP}:${PORT} \\"
     echo "      RUN_DIR=${SHARED} \\"
     echo "          bash ${SCRIPT_DIR}/bench_arm.sh"
+    echo ""
+    echo "  The source line is NOT optional, and skipping it fails in three"
+    echo "  ways that all look like a broken server rather than a bare shell:"
+    echo "    * no conda env      -> 'vllm: command not found'"
+    echo "    * no HF_HOME/TOKEN  -> --dataset-name random cannot load the"
+    echo "                           tokenizer and reaches for the network"
+    echo "    * no no_proxy       -> curl to ${IP} goes to"
+    echo "                           proxy.alcf.anl.gov and the preflight"
+    echo "                           one-token completion fails as if nothing"
+    echo "                           were listening"
+    echo "  It is the same file this server sourced, so client and server"
+    echo "  cannot disagree. It leaves nounset on; 'set +u' afterwards if that"
+    echo "  bothers an interactive shell."
     echo ""
     echo "  Divide this arm's throughput by ${TP} GPUs before comparing it to"
     echo "  the disagg arm's, which spans 8. Read p95/p99 ITL, not the mean."
@@ -541,9 +558,17 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
         printf '  [keep-alive %02d:%02d:%02d] health=%s | %s\n' \
             $(( _ka_el / 3600 )) $(( (_ka_el % 3600) / 60 )) $(( _ka_el % 60 )) \
             "${_ka_h}" \
-            "${_ka_eng:-<no engine stats yet -- idle or still loading>}"
+            "${_ka_eng:-<idle -- no requests yet; the server is up, health says so>}"
 
-        if [ -n "${_ka_eng}" ] && [ "${_ka_eng}" = "${_ka_last}" ]; then
+        # An engine with nothing to do also stops logging, and that is NOT a
+        # stall -- it is the normal state between benches, which is most of what
+        # a held-up server does. Only an unchanged line that still claims
+        # in-flight work is evidence of a wedge.
+        case "${_ka_eng}" in
+            ""|*"Running: 0 reqs, Waiting: 0 reqs"*) _ka_busy=0 ;;
+            *)                                       _ka_busy=1 ;;
+        esac
+        if [ "${_ka_busy}" -eq 1 ] && [ "${_ka_eng}" = "${_ka_last}" ]; then
             _ka_stall=$(( _ka_stall + 1 ))
         else
             _ka_stall=0

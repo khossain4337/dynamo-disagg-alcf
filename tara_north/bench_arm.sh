@@ -135,14 +135,69 @@ echo ""
 #
 # This runs BEFORE snapshot_metrics, so the probe's own tokens are outside the
 # measured diff.
+# Preflight 0 runs before the probe, because the probe's failure mode when the
+# proxy is in the way is a 40-line Squid HTML page that says nothing useful.
+#
+# BOTH of 2026-09-11's operator errors land here, and they compound: the run was
+# benched with the PREVIOUS run's BASE_URL (a different node, after a node swap)
+# from a shell that had conda active but had never sourced common_env.sh. Either
+# alone produces a proxied request; together they produce a Squid error page
+# that reads as "the server is broken".
+#
+# This is also why a stale IP cannot survive even in a correctly-sourced shell:
+# no_proxy is generated per run from THAT run's node, so last run's address is
+# not in it. The check turns a confusing HTML dump into the actual sentence.
+_bu_host=${BASE_URL#*://}; _bu_host=${_bu_host%%/*}; _bu_host=${_bu_host%%:*}
+case "${no_proxy:-}" in
+    '*') : ;;                                   # curl's blanket bypass
+    *)
+        case ",${no_proxy:-}," in
+            *",${_bu_host},"*) : ;;
+            *)
+                echo "FATAL: ${_bu_host} is not in \$no_proxy." >&2
+                echo "" >&2
+                echo "  Every request -- this script's curl probe and vllm bench" >&2
+                echo "  serve's own HTTP client alike -- goes to" >&2
+                echo "  ${http_proxy:-the site proxy}, which cannot route to a" >&2
+                echo "  compute node's HSN address. The reply is a Squid error" >&2
+                echo "  page, not a refused connection, so it looks like a dead" >&2
+                echo "  server rather than a misrouted client." >&2
+                echo "" >&2
+                echo "    no_proxy   ${no_proxy:-<unset>}" >&2
+                echo "    BASE_URL   ${BASE_URL}" >&2
+                echo "" >&2
+                echo "  Two causes, and they look identical from here:" >&2
+                echo "    * the shell never sourced the run's environment:" >&2
+                echo "          source ${RUN_DIR:-<RUN_DIR>}/common_env.sh" >&2
+                echo "    * BASE_URL came from an EARLIER run's banner. no_proxy" >&2
+                echo "      is generated per run from that run's node, so an" >&2
+                echo "      address from a previous allocation is never in it." >&2
+                echo "      Take BASE_URL from the banner of the server that is" >&2
+                echo "      up right now." >&2
+                exit 1
+                ;;
+        esac
+        ;;
+esac
+
 _probe=$(curl -s -S --max-time 120 -X POST "${BASE_URL}/v1/completions" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"${MODEL}\",\"prompt\":\"ping\",\"max_tokens\":1,\"temperature\":0}" 2>&1)
 if ! printf '%s' "${_probe}" | grep -q '"choices"'; then
     echo "FATAL: ${BASE_URL} did not answer a one-token completion." >&2
     echo "  model: ${MODEL}" >&2
-    printf '%s\n' "${_probe}" | head -c 800 >&2
-    echo "" >&2
+    # An HTML body is never vLLM. Say so in one line instead of dumping 800
+    # bytes of Squid stylesheet and burying the diagnosis under it.
+    if printf '%s' "${_probe}" | grep -qiE '<!DOCTYPE html|<html|squid'; then
+        echo "  The reply is an HTML error page, so it came from an HTTP proxy," >&2
+        echo "  not from vLLM. Preflight 0 should have caught this -- if it did" >&2
+        echo "  not, \$no_proxy names ${_bu_host} but something else is" >&2
+        echo "  intercepting: check \$http_proxy/\$https_proxy and that you are" >&2
+        echo "  on the HSN." >&2
+    else
+        printf '%s\n' "${_probe}" | head -c 800 >&2
+        echo "" >&2
+    fi
     echo "  A 404 here means the front end does not serve /v1/completions." >&2
     echo "  An empty reply means nothing is listening on that host:port --" >&2
     echo "  check you are on the HSN (these are get_hsn_ip addresses) and that" >&2
