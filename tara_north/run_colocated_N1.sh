@@ -252,17 +252,55 @@ if fuser "${PORT}/tcp" >/dev/null 2>&1; then
     echo "PREFLIGHT: port ${PORT} is already bound." >&2
     _preflight_fail=1
 fi
+# GPU MEMORY IS ADVISORY, NOT A GATE. This bar used to be 1024 MiB and it
+# refused every node on the system.
+#
+# MEASURED 2026-09-11 across several fresh PBS allocations, including two
+# separate allocations of x4820c7s6b1n0 hours apart:
+#     GPU 0: 1026-1027 MiB    GPU 1: 1 MiB
+#     GPU 2: 2049      MiB    GPU 3: 2049-2050 MiB
+# Same pattern, different jobs, different nodes. It is a system baseline, not
+# our leak -- root-owned daemons (DCGM's nv-hostengine, fabric manager, the
+# IMEX daemon) hold it permanently. `nvidia-smi` prints "No running processes
+# found" underneath because a non-root user cannot see root's pids in its
+# process table; `ps -eo pid,user,comm | grep -i dcgm` can.
+#
+# WHY THIS MATTERS BEYOND THE GATE. The baseline is UNEVEN across GPUs, and it
+# is what makes the per-rank KV pools differ: on 2026-09-11, TP0/TP1 came up
+# with 23.43 GiB of KV and TP2/TP3 with 21.43 GiB, and the hybrid allocator
+# sizes the pool to the MINIMUM rank. That is a real tax, but it is the same
+# tax on every node, so both Figure 2 arms pay it equally and the comparison
+# survives. What would NOT survive is one arm running on a node that also has
+# a few GB of somebody's orphaned process on top -- hence the loud print. The
+# per-GPU numbers go into the launch log so any two runs can be compared after
+# the fact instead of argued about.
+#
+# The gate that actually protects a run is the pgrep/fuser block above: our own
+# leftover processes take the port and contend for the GPU. Raw MiB does not.
+GPU_DIRTY_MIB=${GPU_DIRTY_MIB:-4096}
+_gpu_note=""
 while read -r _idx _used; do
-    if [ "${_used:-0}" -gt 1024 ]; then
-        echo "PREFLIGHT: GPU ${_idx} already holds ${_used} MiB." >&2
+    _gpu_note="${_gpu_note}    GPU ${_idx}: ${_used} MiB\n"
+    if [ "${_used:-0}" -gt "${GPU_DIRTY_MIB}" ]; then
+        echo "PREFLIGHT: GPU ${_idx} holds ${_used} MiB, over the ${GPU_DIRTY_MIB} MiB bar." >&2
         _preflight_fail=1
     fi
 done < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ',')
+echo "PREFLIGHT: GPU memory at launch (~1-2 GiB per GPU is this system's"
+echo "           permanent baseline -- see the comment above, not a problem):"
+printf '%b' "${_gpu_note}"
 if [ "${_preflight_fail}" -ne 0 ]; then
     echo "" >&2
     echo "Refusing to start on a dirty node -- clear the above and re-run." >&2
     echo "  pkill -KILL -f 'vllm serve'; pkill -KILL -f 'VLLM::EngineCor'" >&2
     echo "  pkill -KILL -f 'Worker_TP';  fuser -k ${PORT}/tcp" >&2
+    echo "" >&2
+    echo "If pgrep and fuser found nothing and it is only the GPU MiB line, the" >&2
+    echo "memory belongs to a process you cannot see or kill. A fresh allocation" >&2
+    echo "is the only lever without root. If every allocation looks like this," >&2
+    echo "the baseline has moved: confirm with ps, then raise the bar --" >&2
+    echo "  GPU_DIRTY_MIB=8192 bash ${0##*/}" >&2
+    echo "-- and record the new measured baseline in the comment above." >&2
     exit 1
 fi
 
