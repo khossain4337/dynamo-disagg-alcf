@@ -1070,9 +1070,27 @@ echo ""
 # that rank forks all ${TP} workers itself, so any PALS mask hits the whole
 # tree. `none` (all 288 cores) is the only setting that does not strangle
 # ${TP} workers into one rank's slice. But it grants freedom, not placement --
-# nothing pulls worker i toward NUMA i, and vLLM 0.27.1 has no hook to do it:
-# the entire CPU story for GPU workers is multiproc_executor.py:1060-1088,
-# which only forces OMP_NUM_THREADS=1.
+# nothing pulls worker i toward NUMA i.
+#
+# CORRECTED 2026-09-11. This comment used to say vLLM 0.27.1 had no hook for
+# that. It does. `--numa-bind` (arg_utils.py:1021, with --numa-bind-nodes and
+# --numa-bind-cpus) wraps each worker subprocess spawn in
+# `numactl --physcpubind=<cpus> --membind=<node>` (numa_utils.py:350-370) and
+# binds the EngineCore as well (core.py:1292). That is numactl around the spawn
+# -- the exact thing PIN_WORKERS below is documented as unable to do -- and
+# --membind places PAGES, not just threads. PIN_WORKERS is superseded by it.
+#
+# Deliberately NOT enabled here yet. It changes serving performance, so it gets
+# its own one-variable run after --api-server-count rather than riding along
+# with it. When it does: pass the mapping explicitly rather than auto-detecting,
+#
+#     --numa-bind --numa-bind-nodes 0,1,2,3
+#
+# because on Grace-Hopper the GPU's own HBM is itself a NUMA node -- this node
+# reports GPU NUMA IDs 4/12/20/28 against CPU NUMA affinity 0/1/2/3 -- and an
+# auto-detect that picks the HBM node would --membind host allocations onto GPU
+# memory. The mapping above matches the recorded topology: GPU i <-> cores
+# 72i..72i+71 <-> NUMA i.
 #
 # Cost is UNMEASURED. Expect little for Q1-Q4 -- the KV payload goes GPU-to-NIC
 # over GPUDirect and never touches host memory, so what crosses NUMA is the

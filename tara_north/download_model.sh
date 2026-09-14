@@ -7,6 +7,29 @@ set -uo pipefail
 #   bash download_model.sh                    # Nemotron-3-Super-120B-A12B-BF16
 #   MODEL=<repo-id> bash download_model.sh    # anything else
 #   FOREGROUND=1 bash download_model.sh       # watch it instead of backgrounding
+#   MODEL=<repo-id> VERIFY=1 bash download_model.sh   # check, fetch nothing
+#
+# THE INKLING PAIR. Both are public, ungated, apache-2.0, and both of these ARE
+# the BF16 originals -- the quantized checkpoints live at the parallel *-NVFP4
+# repo ids, so there is no BF16-specific repo to hunt for. Sizes read off the HF
+# model index on 2026-09-14, NOT the model card:
+#
+#   thinkingmachines/Inkling-Small   266 B params   532 GB /  495 GiB   32 shards
+#   thinkingmachines/Inkling         952 B params  1905 GB / 1774 GiB  108 shards
+#
+#   MODEL=thinkingmachines/Inkling-Small NEED_GB=560  bash download_model.sh
+#   MODEL=thinkingmachines/Inkling       NEED_GB=1900 bash download_model.sh
+#
+# RUN THEM ONE AT A TIME, not concurrently. The space check below reads free
+# space at THIS instant, so two jobs started together each see enough room and
+# together do not have it; and MAX_WORKERS streams share one ALCF proxy, so
+# concurrency buys nothing but a second way to fail. Small first -- it is the
+# one blocking run_inkling_colocated_N2.sh.
+#
+# Each repo also ships an mtp.safetensors that is NOT listed in
+# model.safetensors.index.json, so verify_cache() below does not check it. A
+# no-filter `hf download` fetches it regardless. It only matters if MTP is ever
+# enabled, which it is not (--speculative-config is deliberately unset).
 #
 # WHY A SEPARATE STEP AND NOT JUST `vllm serve <repo>`
 #
@@ -71,14 +94,26 @@ LOG=${LOG:-${HF_HOME}/download_$(basename "${MODEL}")_${STAMP}.log}
 # anonymous fetch returns 401 on the weights while still serving config.json.
 # That failure mode is confusing: the tokenizer and config arrive, the shards
 # do not, and it looks like a network problem.
+#
+# WARN, DO NOT EXIT. This used to be a hard `exit 1`, which is wrong for the
+# repos this script is now mostly pointed at: thinkingmachines/Inkling{,-Small}
+# are ungated and apache-2.0 and fetch fine anonymously, so a missing token
+# blocked a download that would have worked. The 401 case is not silent either
+# -- verify_cache() checks the manifest and names the missing shards, which is
+# the check that should be trusted anyway. Gatedness is a per-repo fact this
+# script cannot know offline, so it says what it sees and lets the fetch decide.
 if [ -z "${HF_TOKEN:-}" ]; then
     if [ -f ~/.hf_token ]; then
         HF_TOKEN=$(cat ~/.hf_token)
         export HF_TOKEN
     else
-        echo "No HF_TOKEN and no ~/.hf_token. Gated nvidia/* weights will 401."
-        echo "  echo <token> > ~/.hf_token && chmod 600 ~/.hf_token"
-        exit 1
+        echo "NOTE: no HF_TOKEN and no ~/.hf_token -- fetching anonymously."
+        echo "  Fine for ungated repos (thinkingmachines/Inkling*, apache-2.0)."
+        echo "  Gated ones (nvidia/*) will 401 on the WEIGHTS while still"
+        echo "  serving config.json, which reads as a network fault. If the"
+        echo "  completeness check below names missing shards, that is why:"
+        echo "    echo <token> > ~/.hf_token && chmod 600 ~/.hf_token"
+        echo ""
     fi
 fi
 
@@ -212,10 +247,21 @@ if [ -n "${VERIFY:-}" ]; then
 fi
 
 # --- Space check -------------------------------------------------------------
-# 247 GB of shards. Ask for 300 GB: HF stages each file as <blob>.incomplete
-# and renames on completion, so peak usage is roughly the final size plus one
-# in-flight shard, and filling a shared /vast is everyone's problem, not just
-# this run's.
+# HF stages each file as <blob>.incomplete and renames on completion, so peak
+# usage is roughly the final size plus one in-flight shard. Filling a shared
+# /vast is everyone's problem, not just this run's, so ask for headroom.
+#
+# MIND THE UNITS: `df -BG` counts in GiB but labels them "G", so NEED_GB is
+# compared against GiB and should be set in GiB. At Nemotron's 230 GiB the
+# default 300 was conservative by accident. At Inkling scale the gap matters:
+#
+#   Nemotron-3-Super-120B-A12B-BF16   230 GiB  -> the 300 default is fine
+#   thinkingmachines/Inkling-Small    495 GiB  -> NEED_GB=560
+#   thinkingmachines/Inkling         1774 GiB  -> NEED_GB=1900
+#
+# The default stays at 300 because it belongs to the default MODEL. Anything
+# larger must pass NEED_GB, or the check waves through a download that fills
+# the filesystem two hours in.
 NEED_GB=${NEED_GB:-300}
 mkdir -p "${HF_HOME}"
 AVAIL_GB=$(df -BG --output=avail "${HF_HOME}" 2>/dev/null | tail -1 | tr -dc '0-9')
@@ -276,9 +322,14 @@ else
     echo ""
     echo "  watch:    tail -f ${LOG}"
     echo "  progress: du -sh ${HF_HOME}/hub/models--${MODEL//\//--}"
-    echo "  verify:   VERIFY=1 bash ${BASH_SOURCE[0]}"
+    # MODEL= is carried into the verify line on purpose. Without it the command
+    # verifies the DEFAULT model, so a Nemotron cache that is already complete
+    # prints COMPLETE while the Inkling download it was meant to check is still
+    # half a terabyte from done.
+    echo "  verify:   MODEL=${MODEL} VERIFY=1 bash ${BASH_SOURCE[0]}"
     echo ""
-    echo "Expect ~247 GB across ~50 safetensors shards. VERIFY=1 checks the"
-    echo "cache against the model's own weight manifest and prints COMPLETE or"
-    echo "names the missing shards -- do that before serving, not du."
+    echo "VERIFY=1 checks the cache against the model's own weight manifest and"
+    echo "prints COMPLETE or names the missing shards. Do that before serving,"
+    echo "not du -- du counts configs, the tokenizer and any stale snapshot, and"
+    echo "a truncated shard set can be most of the bytes and still not load."
 fi
