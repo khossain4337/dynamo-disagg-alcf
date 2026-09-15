@@ -62,6 +62,31 @@ export HF_DATASETS_CACHE=\${HF_HOME}
 export HF_MODULES_CACHE=\${HF_HOME}
 export RAY_TMPDIR=/tmp
 export TMPDIR=/tmp
+# COMPILER CACHES MUST BE NODE-LOCAL. Unset, these default under \$HOME, which
+# is a shared network filesystem here, and that combination kills a multi-rank
+# launch outright: eight workers across two nodes JIT the same MoE kernels at
+# the same moment during determine_available_memory(), Triton writes each cache
+# entry as temp-file-then-rename, and on a network filesystem a rename can
+# invalidate another rank's already-open handle server-side. The reader then
+# gets OSError: [Errno 116] Stale file handle out of
+# compiler.py:412 metadata_path.read_text(), one worker dies, and the engine
+# takes the whole application down AFTER a full 8-minute weight load
+# (2026-09-15, Inkling colocated, twice). On a local filesystem the inode
+# survives the rename and the race is simply not expressible.
+#
+# This is also the standing "never write output to \$HOME" rule: a compiler
+# cache is output. TMPDIR and RAY_TMPDIR above already establish /tmp as the
+# node-local scratch on these nodes.
+#
+# Per-USER rather than per-run, deliberately: Triton keys cache entries by a
+# hash that includes the Triton version and the kernel source, so reuse across
+# runs is safe, and it buys a warm cache on relaunch. Each node has its own
+# /tmp, so there is no cross-node contention to reuse INTO. Steady-state
+# throughput is unaffected either way -- compilation lands in startup and in
+# bench_arm.sh's warmup, never in the measured window.
+export TRITON_CACHE_DIR=/tmp/triton_cache_\${USER}
+export VLLM_CACHE_ROOT=/tmp/vllm_cache_\${USER}
+mkdir -p "\${TRITON_CACHE_DIR}" "\${VLLM_CACHE_ROOT}" 2>/dev/null || true
 export VLLM_LOGGING_LEVEL=INFO
 ${UCX_LINES}
 ${GPU_PIN_LINE}
