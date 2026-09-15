@@ -9,8 +9,12 @@ set -uo pipefail
 # pair up, waits for /health, starts the frontend samplers, and parks so that
 # bench_arm.sh can drive it from the client node:
 #
-#     ARM=inkling-colocated BASE_URL=http://<HEAD_IP>:8100 RUN_DIR=<run dir> \
-#         bash bench_arm.sh
+#     ARM=inkling-colocated MODEL=<repo id> GPUS=8 \
+#         BASE_URL=http://<HEAD_IP>:8100 RUN_DIR=<run dir> bash bench_arm.sh
+#
+# MODEL and GPUS are not optional: bench_arm.sh defaults MODEL to Nemotron and
+# GPUS to 4. The keep-alive banner prints the whole command with both filled in
+# -- copy it from there rather than from here.
 #
 # WHY THE COLOCATED BASELINE IS NOW MULTI-NODE, AND WHY THAT IS GOOD NEWS.
 # Inkling-Small is 266B at BF16 = 532 GB of weights against ~345 GB usable per
@@ -113,6 +117,27 @@ set -uo pipefail
 #
 #     diff <(sed -n '/^exec vllm serve/,$p' <colo-run>/launch_role.sh) \
 #          <(sed -n '/^exec vllm serve/,$p' <disagg-run>/launch_role.sh)
+#
+# THE POOL GATE IS PART OF THE RULE, BUT ITS THRESHOLD IS NOT SHARED. Both
+# launchers must gate on the KV pool before anything is benched (see the gate
+# near the end of this file, and the Nemotron disagg launcher that had none).
+# What does NOT carry across is the NUMBER. The pool is whatever is left after
+# weights and the activation profile, and the activation profile is driven by
+# --max-num-batched-tokens, which is exactly the one knob the ONE RULE lets the
+# arms differ on:
+#
+#     colocated   16384 tok / 256 seq     (per-knob max of the two below)
+#     P           16384 tok /  32 seq
+#     D            2048 tok / 256 seq
+#
+# Three configurations, three pools. So EXPECT_POOL from this arm is meaningless
+# on either disagg role, and a single EXPECT_POOL across P and D would be
+# meaningless on at least one of them. run_inkling_1p1d_N4.sh takes
+# EXPECT_POOL_P and EXPECT_POOL_D as separate gates, each established from that
+# role's own first healthy launch, and takes the minimum WITHIN a role across
+# that role's ranks -- never across roles. This arm gets away with one number
+# only because head and headless are configured identically here, which is what
+# makes a single minimum mean anything.
 #
 # ENVIRONMENT COMES FROM emit_common_env.sh AND THE SAMPLER FROM
 # emit_conn_sampler.sh, both sourced, not copied. Those are the single copies
@@ -909,8 +934,11 @@ else
         fi
     else
         echo "  No EXPECT_POOL set -- this run establishes it. Record this number"
-        echo "  and pass EXPECT_POOL=${_pool} on every subsequent Inkling launch,"
-        echo "  BOTH arms."
+        echo "  and pass EXPECT_POOL=${_pool} on every subsequent COLOCATED launch."
+        echo "  It does NOT transfer to the disagg arm: P and D have different"
+        echo "  --max-num-batched-tokens (16384 / 2048) and therefore different"
+        echo "  activation profiles and different pools. Each disagg role"
+        echo "  establishes its own number -- see THE ONE RULE in the header."
     fi
 fi
 echo "${_pool:-unknown}" > "${SHARED}/kv_pool_tokens.txt"
@@ -976,7 +1004,7 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
     echo "  Model string for --model:  ${MODEL}"
     echo "  Run dir:                   ${SHARED}"
     echo "  max-model-len:             ${MAX_MODEL_LEN}"
-    echo "  Serving GPUs:              $(( DP * TP ))  (pass GPUS -- see below)"
+    echo "  Serving GPUs:              $(( DP * TP ))  (passed as GPUS below; bench_arm.sh defaults to 4)"
     echo ""
     echo "  From another shell ON THIS NODE (${CLIENT_HOST}) -- the client node,"
     echo "  which serves nothing. Do NOT bench from ${NODE_HEAD_SHORT} or"
@@ -987,11 +1015,24 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
     echo "      source ${SHARED}/common_env.sh"
     echo ""
     echo "      ARM=inkling-colocated \\"
+    echo "      MODEL=${MODEL} \\"
+    echo "      GPUS=$(( DP * TP )) \\"
     echo "      BASE_URL=http://${HEAD_IP}:${PORT} \\"
     echo "      METRICS_URLS=http://${HEAD_IP}:${PORT} \\"
     echo "      WORKLOAD=${WORKLOAD} \\"
     echo "      RUN_DIR=${SHARED} \\"
     echo "          bash ${SCRIPT_DIR}/bench_arm.sh"
+    echo ""
+    echo "  MODEL AND GPUS ARE BOTH REQUIRED HERE, and both fail quietly:"
+    echo "    * bench_arm.sh defaults MODEL to the Nemotron repo id (:32). A"
+    echo "      wrong --model is an HTTP 400 PER REQUEST, which returns instantly"
+    echo "      and therefore reads on the progress bar as a fast run rather"
+    echo "      than as a fault -- the same trap as an undersized max-model-len."
+    echo "    * GPUS defaults to 4 for every ARM that is not literally 'disagg'"
+    echo "      (:77-80), sized for the Nemotron colocated arm. This arm serves"
+    echo "      $(( DP * TP )) (DP ${DP} x TP ${TP}), so the default would report every"
+    echo "      per-GPU number at $(( DP * TP / 4 ))x -- in the favourable direction, in the"
+    echo "      figure the whole study turns on."
     echo ""
     echo "  The source line is NOT optional, and skipping it fails in three ways"
     echo "  that all look like a broken server rather than a bare shell:"
