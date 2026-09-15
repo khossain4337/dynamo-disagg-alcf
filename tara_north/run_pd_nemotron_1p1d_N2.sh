@@ -1084,7 +1084,16 @@ echo ""
 # its own one-variable run after --api-server-count rather than riding along
 # with it. When it does: pass the mapping explicitly rather than auto-detecting,
 #
-#     --numa-bind --numa-bind-nodes 0,1,2,3
+#     --numa-bind --numa-bind-nodes 0 1 2 3
+#
+# SPACES, NOT COMMAS. This line said 0,1,2,3 until 2026-09-15, when the Inkling
+# colocated launcher became the first script in this project to actually PASS
+# the flag and argparse rejected it on sight: --numa-bind-nodes is nargs='+' of
+# int, so the comma form is "Value 0,1,2,3 cannot be converted to <class 'int'>",
+# rank 0 exits code 2 and PALS tears the application down before any weight is
+# read. The list is also indexed BY GPU INDEX and must carry one entry per
+# visible GPU (numa_utils.py:261-263), not a set of available nodes; four
+# separate Grace NUMA nodes here make the identity map correct by coincidence.
 #
 # because on Grace-Hopper the GPU's own HBM is itself a NUMA node -- this node
 # reports GPU NUMA IDs 4/12/20/28 against CPU NUMA affinity 0/1/2/3 -- and an

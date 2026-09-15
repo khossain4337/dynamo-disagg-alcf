@@ -435,8 +435,33 @@ MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
 # the 2026-09-14 result that a local benchmark client moved ENGINE-side numbers
 # by 14.4%. The sampler records each API server's last-run core every interval
 # so the question can be answered from a run rather than from memory.
+#
+# THE SEPARATOR IS A SPACE, NOT A COMMA, AND THE LIST IS INDEXED BY GPU INDEX.
+# `--numa-bind-nodes` is nargs='+' of int, so the comma form dies instantly at
+# argparse with "Value 0,1,2,3 cannot be converted to <class 'int'>" -- rank 0
+# exits code 2, PALS signal-15s rank 1, and the whole application is gone before
+# a single weight is read (2026-09-15, the first Inkling launch, which is the
+# first time this flag has EVER actually run in this project: on Nemotron it
+# lives only inside a comment block at run_pd_nemotron_1p1d_N2.sh:1076-1087 and
+# was never passed. A form that has only ever been written down is not a form
+# that has been tested -- same trap as EXPERT_PARALLEL in MEMORY_2026-09-14c.md).
+#
+# The semantics are NOT "the set of NUMA nodes available". numa_utils.py:261-263
+# indexes this list BY GPU INDEX and raises if gpu_index >= len(numa_bind_nodes),
+# so it needs one entry per VISIBLE GPU, in GPU order. vLLM's own test uses
+# [0, 0, 1, 1] for four GPUs across two NUMA nodes
+# (tests/engine/test_arg_utils.py:605-621). Here the four GH200 modules are four
+# separate Grace NUMA nodes, one per GPU, so the identity map is correct and the
+# VALUES are unchanged from the comma version -- only the separator moves.
+#
+# Unquoted on purpose where it is consumed, so the four words split into four
+# array elements. Verify the mapping on a role node if these numbers are ever in
+# doubt: `numactl -H` for the CPU nodes, and
+# `nvidia-smi --query-gpu=index,pci.bus_id --format=csv` against
+# /sys/bus/pci/devices/<id>/numa_node for the GPU-to-node association. CPU
+# affinity is 0/1/2/3; 4/12/20/28 are the HBM nodes and must NOT appear here.
 NUMA_BIND=${NUMA_BIND:-1}
-NUMA_BIND_NODES=${NUMA_BIND_NODES:-0,1,2,3}
+NUMA_BIND_NODES="${NUMA_BIND_NODES:-0 1 2 3}"
 
 KEEP_ALIVE=${KEEP_ALIVE:-1}
 KEEP_ALIVE_POLL_S=${KEEP_ALIVE_POLL_S:-60}
@@ -840,7 +865,15 @@ CPU_BIND_ARGS=()
 [ -n "${MPI_CPU_BIND}" ] && CPU_BIND_ARGS=(--cpu-bind "${MPI_CPU_BIND}")
 MPI_HOSTS="${NODE_HEAD},${NODE_TAIL}"
 
-touch "${SHARED}/logs/head.log" "${SHARED}/logs/headless.log"
+# mpiexec.log IS IN THIS touch DELIBERATELY. `cmd > file &` creates the file in
+# the FORKED CHILD, so the parent can reach `tail -f` first and lose the race --
+# tail prints "cannot open ... No such file or directory / no files remaining"
+# and exits, and the ONE stream that carries PALS-level failures is silently not
+# being followed for the rest of the run. Observed on the first Inkling launch,
+# 2026-09-15: head.log and headless.log tailed fine purely because they were in
+# this touch and mpiexec.log was not.
+touch "${SHARED}/logs/head.log" "${SHARED}/logs/headless.log" \
+      "${SHARED}/logs/mpiexec.log"
 echo ""
 echo "Launching: mpiexec -n ${DP} -ppn 1 --hosts ${MPI_HOSTS}"
 mpiexec -n "${DP}" -ppn 1 --hosts "${MPI_HOSTS}" \
@@ -876,6 +909,20 @@ wait_healthy() {
             echo "  Read ${SHARED}/logs/mpiexec.log FIRST: a PALS-level failure" >&2
             echo "  (bad VNI, node not in the allocation, launcher error) never" >&2
             echo "  reaches head.log or headless.log at all." >&2
+            # DUMP THE LOGS HERE RATHER THAN NAMING THEM. cleanup() kills the
+            # `tail -f | sed` pipelines within a second of this return, and a
+            # `vllm serve` that dies on an argparse error writes its reason and
+            # exits faster than that pipeline flushes -- so the operator sees
+            # the role BANNER, then nothing, then teardown, and has to go read
+            # files by hand to learn anything at all (2026-09-15, first Inkling
+            # launch). The reason is on disk; print it while we still can.
+            for _l in mpiexec head headless; do
+                echo "" >&2
+                echo "  --- last 40 lines of logs/${_l}.log ---" >&2
+                tail -n 40 "${SHARED}/logs/${_l}.log" 2>/dev/null \
+                    | sed 's/^/    /' >&2 \
+                    || echo "    (no ${_l}.log)" >&2
+            done
             return 1
         fi
         if [ $(( i % 12 )) -eq 0 ]; then
