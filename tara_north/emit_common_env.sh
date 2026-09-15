@@ -87,7 +87,13 @@ export TMPDIR=/tmp
 export TRITON_CACHE_DIR=/tmp/triton_cache_\${USER}
 export VLLM_CACHE_ROOT=/tmp/vllm_cache_\${USER}
 mkdir -p "\${TRITON_CACHE_DIR}" "\${VLLM_CACHE_ROOT}" 2>/dev/null || true
-export VLLM_LOGGING_LEVEL=INFO
+# Expanded HERE, on the client node at emit time (this heredoc is unquoted), so
+# a one-off VLLM_LOGGING_LEVEL=DEBUG in the launching shell reaches every rank.
+# Written bare as INFO it did not: common_env.sh is sourced on each node AFTER
+# the caller's environment, so the hardcoded value silently won and a DEBUG
+# launch produced an INFO log (2026-09-15). INFO stays the default -- DEBUG is
+# a diagnostic, never a measured run.
+export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
 ${UCX_LINES}
 ${GPU_PIN_LINE}
 EOF
