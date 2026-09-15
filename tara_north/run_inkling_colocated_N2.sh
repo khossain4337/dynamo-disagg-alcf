@@ -574,9 +574,42 @@ ssh -n "${NODE_TAIL}" "test -d ${SHARED}" || {
 # Bracketed patterns ('[v]llm serve') because `ssh host "pkill -f 'vllm serve'"`
 # runs through `bash -c` on the far side and THAT shell's command line contains
 # the string being searched for, so pgrep matches its own parent.
-PAT_VLLM='[v]llm serve'
-PAT_ENGINE='[V]LLM::EngineCor'
-PAT_WORKER='[W]orker_TP'
+#
+# THE PATTERNS MUST TRACK vLLM'S PROCESS TITLES, AND THEY DRIFTED. 'Worker_TP'
+# was written against the Nemotron-era naming. Under DP + EP the workers are
+# titled Worker_DP0_TP1_EP1 / Worker_DP1_TP0_EP4, in which the substring
+# "Worker_TP" DOES NOT OCCUR -- so the pattern matched nothing, in BOTH places
+# it is used. Preflight therefore declared a node clean while a previous run's
+# workers were still resident on it, and worse, cleanup()'s
+# `pkill -KILL -f 'Worker_TP'` never killed them in the first place: a failed
+# launch left eight live workers holding GPU memory and reported a tidy
+# teardown. Observed 2026-09-15 as 15.64 GiB occupied on head cuda:1 at
+# init_device, which fails the startup snapshot check before any weight loads.
+#
+# Same drift on the engine title: the logs show EngineCore_DP0, not the older
+# VLLM::EngineCore. Both spellings are kept -- an over-broad kill pattern costs
+# nothing here because these nodes run nothing else of ours, while a pattern
+# that silently matches zero processes is indistinguishable from a clean node.
+# WHEN vLLM IS UPGRADED, RE-CHECK THESE AGAINST `pgrep -af` ON A LIVE RUN.
+# THE LIST LIVES IN gpu_cleanup.sh AND IS SOURCED, NOT COPIED -- the same rule
+# emit_common_env.sh, emit_conn_sampler.sh and workload_profile.sh follow, and
+# for the same reason. A second copy is how 'Worker_TP' survived a naming change
+# in two places at once. gpu_cleanup.sh is also what teardown executes on each
+# role node, so the patterns screened here and the patterns killed there are the
+# same array by construction rather than by review.
+if [ ! -f "${SCRIPT_DIR}/gpu_cleanup.sh" ]; then
+    echo "FATAL: missing ${SCRIPT_DIR}/gpu_cleanup.sh -- preflight and teardown" >&2
+    echo "  both read the process-pattern list from it." >&2
+    exit 1
+fi
+# shellcheck source=./gpu_cleanup.sh
+source "${SCRIPT_DIR}/gpu_cleanup.sh"
+PAT_ALL=("${VLLM_PROC_PATTERNS[@]}")
+PAT_VLLM="${VLLM_PROC_PATTERNS[0]}"
+ssh -n "${NODE_TAIL}" "test -f ${SCRIPT_DIR}/gpu_cleanup.sh" || {
+    echo "FATAL: ${SCRIPT_DIR}/gpu_cleanup.sh is not visible from ${NODE_TAIL_SHORT}." >&2
+    exit 1
+}
 
 # GPU MEMORY IS ADVISORY, NOT A GATE, and the bar is deliberately loose.
 # MEASURED across several fresh PBS allocations: GPU 0 at 1026-1027 MiB, GPU 1
@@ -588,46 +621,48 @@ PAT_WORKER='[W]orker_TP'
 # SURVIVING A REALLOCATION is a leaked context and the answer is another node,
 # not a higher bar.
 GPU_DIRTY_MIB=${GPU_DIRTY_MIB:-4096}
+# The per-node inspection is gpu_cleanup.sh's report mode, run over ssh on each
+# role node and gated on its exit status. It is the same file teardown executes
+# and the same array sourced above, so a launch cannot screen for one set of
+# processes and kill a different one. It also prints the kernel-side HBM view
+# and names the owning pid, which is what turns "GPU 1 holds 15.6 GiB" from a
+# reason to abandon the node into a kill command.
 _preflight_fail=0
 for n in "${NODE_HEAD}" "${NODE_TAIL}"; do
     _short="${n%%.*}"
-    for _pat in "${PAT_VLLM}" "${PAT_ENGINE}" "${PAT_WORKER}"; do
-        if ssh -n "$n" "pgrep -f \"${_pat}\"" >/dev/null 2>&1; then
-            echo "PREFLIGHT ${_short}: surviving process matching ${_pat}:" >&2
-            ssh -n "$n" "pgrep -af \"${_pat}\"" 2>/dev/null | sed 's/^/    /' >&2
-            _preflight_fail=1
-        fi
-    done
+    echo "PREFLIGHT ${_short}:"
+    ssh -n "$n" "GPU_DIRTY_MIB=${GPU_DIRTY_MIB} bash ${SCRIPT_DIR}/gpu_cleanup.sh report" \
+        2>&1 | sed 's/^/  /'
+    # PIPESTATUS, not $?, which would be sed's. Getting this wrong makes the
+    # gate pass unconditionally, which is worse than having no gate: it reads
+    # as a node that was checked.
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        _preflight_fail=1
+    fi
     if [ "$n" = "${NODE_HEAD}" ] && ssh -n "$n" "fuser ${PORT}/tcp" >/dev/null 2>&1; then
         echo "PREFLIGHT ${_short}: port ${PORT} is already bound." >&2
         _preflight_fail=1
     fi
-    echo "PREFLIGHT ${_short}: GPU memory at launch (1-2 GiB/GPU is this system's baseline):"
-    while read -r _idx _used; do
-        printf '    GPU %s: %s MiB\n' "${_idx}" "${_used}"
-        if [ "${_used:-0}" -gt "${GPU_DIRTY_MIB}" ]; then
-            echo "PREFLIGHT ${_short}: GPU ${_idx} holds ${_used} MiB, over the ${GPU_DIRTY_MIB} MiB bar." >&2
-            _preflight_fail=1
-        fi
-    done < <(ssh -n "$n" "nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits" 2>/dev/null | tr -d ',')
 done
 if [ "${_preflight_fail}" -ne 0 ]; then
     echo "" >&2
-    echo "Refusing to start on a dirty node -- clear the above and re-run." >&2
+    echo "Refusing to start on a dirty node. Clear it with the same file the" >&2
+    echo "report above came from, so the sweep and the screen agree:" >&2
+    echo "" >&2
     echo "  for n in ${NODE_HEAD_SHORT} ${NODE_TAIL_SHORT}; do" >&2
-    echo "    ssh \$n \"pkill -KILL -f 'vllm serve'; pkill -KILL -f 'VLLM::EngineCor'\"" >&2
-    echo "    ssh \$n \"pkill -KILL -f 'Worker_TP'; fuser -k ${PORT}/tcp\"" >&2
+    echo "    ssh \$n \"bash ${SCRIPT_DIR}/gpu_cleanup.sh kill ${PORT} ${DP_RPC_PORT}\"" >&2
     echo "  done" >&2
     echo "" >&2
-    echo "If pgrep and fuser found nothing and it is only the GPU MiB line, the" >&2
-    echo "memory belongs to a process you cannot see or kill. TAKE ANOTHER NODE." >&2
+    echo "Then re-run this launcher. If the report still shows GPU memory AND" >&2
+    echo "'no process you own holds HBM pages', it belongs to a pid you cannot" >&2
+    echo "see or kill. That is a leaked context: TAKE ANOTHER NODE." >&2
     exit 1
 fi
 
 # =============================================================================
 # Locate the shim and the shared helpers, IN PLACE in the repo
 # =============================================================================
-for f in fi_getinfo_shim.so env_for_libfabric_topology_error.sh \
+for f in fi_getinfo_shim.so env_for_libfabric_topology_error.sh gpu_cleanup.sh \
          emit_common_env.sh emit_conn_sampler.sh workload_profile.sh; do
     if [ ! -f "${SCRIPT_DIR}/${f}" ]; then
         echo "FATAL: missing ${SCRIPT_DIR}/${f}." >&2
@@ -823,25 +858,26 @@ cleanup() {
     done
     kill -TERM ${MPIEXEC_PID:-} ${TAIL_H_PID:-} ${TAIL_T_PID:-} ${TAIL_M_PID:-} 2>/dev/null
     sleep 5
-    # An orphaned EngineCore shows up in `top` as 'VLLM::EngineCor' and matches
-    # no 'vllm serve' pattern; the TP workers are renamed 'VLLM::Worker_TP<n>'
-    # and match neither. Each survivor holds a CUDA context and its share of the
-    # KV pool, and the symptom lands on the NEXT run.
+    # Hand the sweep to gpu_cleanup.sh, which is the SAME file preflight ran in
+    # report mode and the same array it screened on. An orphaned EngineCore is
+    # 'EngineCore_DP<n>' (older builds: 'VLLM::EngineCor') and matches no
+    # 'vllm serve' pattern; the workers are 'Worker_DP<n>_TP<n>_EP<n>' and match
+    # neither. Each survivor holds a CUDA context and its share of the KV pool,
+    # and the symptom lands on the NEXT run, a stage removed from its cause.
+    # Routing both through one file is what stops "cleanup reported success" and
+    # "preflight sees nothing" from meaning different things.
+    #
+    # kill mode ends in a report, so teardown states what it actually left
+    # behind rather than asserting that it left nothing.
     for n in "${NODE_HEAD}" "${NODE_TAIL}"; do
-        ssh -n "$n" "pkill -KILL -f \"${PAT_ENGINE}\"" 2>/dev/null
-        ssh -n "$n" "pkill -KILL -f \"${PAT_WORKER}\"" 2>/dev/null
-        ssh -n "$n" "pkill -KILL -f \"${PAT_VLLM}\""   2>/dev/null
+        ssh -n "$n" "bash ${SCRIPT_DIR}/gpu_cleanup.sh kill ${PORT} ${DP_RPC_PORT}" \
+            2>&1 | sed 's/^/  /'
     done
-    ssh -n "${NODE_HEAD}" "fuser -k ${PORT}/tcp" 2>/dev/null
-    ssh -n "${NODE_HEAD}" "fuser -k ${DP_RPC_PORT}/tcp" 2>/dev/null
-    # Free GPU memory is what actually has to be true before the next run, and
-    # process names are only a proxy for it. This is also the moment the node
-    # can still be handed back, so say it loudly rather than filing it.
-    for n in "${NODE_HEAD}" "${NODE_TAIL}"; do
-        echo "  GPU memory still in use on ${n%%.*}:"
-        ssh -n "$n" "nvidia-smi --query-gpu=index,memory.used --format=csv,noheader" 2>/dev/null \
-            | sed 's/^/    /' || echo "    (nvidia-smi unavailable)"
-    done
+    # The per-node nvidia-smi dump that used to live here is gone: the report at
+    # the end of `gpu_cleanup.sh kill` above prints it, plus the kernel HBM view
+    # and the owning pid, for both nodes. Read the VERDICT lines. A node that
+    # ends DIRTY is the next run's failure, and this is the last moment it can
+    # still be handed back.
     echo "  Run dir: ${SHARED}"
 }
 trap cleanup EXIT INT TERM
