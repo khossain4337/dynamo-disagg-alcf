@@ -1132,6 +1132,83 @@ grep -hoiE 'block_size[ =:]+[0-9]+' "${SHARED}/logs/d-head.log" 2>/dev/null \
     | head -3 | sed 's/^/    /'
 
 # =============================================================================
+# Q3 and Q4 -- the startup-log checks. THEY CANNOT BE RUN LATER.
+# =============================================================================
+# Ported from run_pd_nemotron_1p1d_N2.sh, where Q1-Q4 span ~700 lines. Q1 (the
+# nixl counter deltas) lives in bench_arm.sh. Q2 (/proc/net/dev) is correctly
+# dead -- CXI RDMA is kernel-bypass and never touches the netdev path, so those
+# counters are meaningful only when NON-zero, as a TCP-fallback detector.
+#
+# Q3 and Q4 read lines that are printed ONCE, during agent construction. They
+# are not in /metrics, not on the wire and not recoverable from a running
+# server: a launch that skips them has to be relaunched to get them, which is
+# what happened on 2026-09-16 (DECISIONS_2026-09-16c.md was reconstructed by
+# hand). That is why they belong here and not in bench_arm.sh.
+#
+# WARN, never exit. A relaunch costs the allocation these checks are meant to
+# protect, and the operator can read the log and decide.
+_q_warn=0
+echo ""
+echo "=== Q3: is the transport LIBFABRIC/cxi, or a fallback? ==="
+echo "  fabric_attr->name is libfabric reporting the provider it actually"
+echo "  OPENED. 'Created 4 rails using provider=efa' is NIXL's belief after the"
+echo "  shim's PATCH 2 relabels cxi as efa, and is not a contradiction -- trust"
+echo "  fabric_attr (CLOSED.md). Expect 4 Libfabric backends per node."
+for _r in p-head p-headless d-head d-headless; do
+    _log="${SHARED}/logs/${_r}.log"
+    _cxi=$(grep -c 'fabric_attr->name cxi' "${_log}" 2>/dev/null || true); _cxi=${_cxi:-0}
+    _lfb=$(grep -c 'Initializing Libfabric Backend' "${_log}" 2>/dev/null || true); _lfb=${_lfb:-0}
+    _hmem=$(grep -c 'Using provider with FI_HMEM support' "${_log}" 2>/dev/null || true); _hmem=${_hmem:-0}
+    _vni=$(grep -hoE 'SLINGSHOT_VNIS[=: ]+[0-9]+' "${_log}" 2>/dev/null | head -1 || true)
+    printf '    %-12s cxi=%-4s libfabric=%-4s fi_hmem=%-4s %s\n' \
+        "${_r}" "${_cxi}" "${_lfb}" "${_hmem}" "${_vni:-VNI:unread}"
+    if [ "${_cxi}" -eq 0 ] || [ "${_lfb}" -lt 4 ]; then
+        echo "    ^^ WARNING: ${_r} shows no cxi provider or fewer than 4 backends." >&2
+        _q_warn=1
+    fi
+done
+echo "  VNIs must be IDENTICAL on all four nodes -- one mpiexec, one PALS VNI."
+echo "  Two ssh's instead of one mpiexec kills it, and the agents then build"
+echo "  fine and never connect (CLOSED.md)."
+echo "  UCX residue (two benign lines per side are expected -- "
+echo "  UCX_RCACHE_MAX_UNRELEASED and 'Discovered backend plugin: UCX'):"
+grep -hcE 'UCX' "${SHARED}"/logs/[pd]-head*.log 2>/dev/null | paste -sd' ' - | sed 's/^/    per-log UCX lines: /' || true
+
+echo ""
+echo "=== Q4: did every TP worker build an agent, and did the rails fan out? ==="
+echo "  Expect 4 rail managers x 4 rails per node, and one 'Registered memory"
+echo "  on 1 rails' per device 0-3 -- each worker on its OWN rail. The comment"
+echo "  in the Nemotron launcher saying 'four lines saying 1 rail' is"
+echo "  miscalibrated; this is the correct shape (CLOSED.md)."
+for _r in p-head p-headless d-head d-headless; do
+    _log="${SHARED}/logs/${_r}.log"
+    _rails=$(grep -c 'Rail Manager created with 4 rails' "${_log}" 2>/dev/null || true); _rails=${_rails:-0}
+    _reg=$(grep -c 'Registered memory on 1 rails, mem_type=1' "${_log}" 2>/dev/null || true); _reg=${_reg:-0}
+    _devs=$(grep -hoE 'mem_type=1 device=[0-9]+' "${_log}" 2>/dev/null \
+            | grep -oE '[0-9]+$' | sort -u | paste -sd, - || true)
+    printf '    %-12s rail_managers=%-4s vram_registrations=%-4s devices=%s\n' \
+        "${_r}" "${_rails}" "${_reg}" "${_devs:-none}"
+    if [ "${_rails}" -lt 4 ] || [ "${_reg}" -lt 4 ]; then
+        echo "    ^^ WARNING: ${_r} did not fan out to 4 rails on 4 devices." >&2
+        _q_warn=1
+    fi
+done
+echo "  Accelerator map, head nodes (expect one-to-one, e.g. 9:01:00.0 -> cxi0):"
+grep -hoE '[0-9a-f]{1,2}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] -> cxi[0-3]' \
+    "${SHARED}/logs/p-head.log" "${SHARED}/logs/d-head.log" 2>/dev/null \
+    | sort -u | head -8 | sed 's/^/    /' || true
+
+if [ "${_q_warn}" -ne 0 ]; then
+    echo ""
+    echo "  Q3/Q4 RAISED A WARNING. These lines print once at agent construction" >&2
+    echo "  and cannot be recovered from a running server. Read the role logs" >&2
+    echo "  now, before benching: ${SHARED}/logs/" >&2
+else
+    echo ""
+    echo "  Q3 and Q4 PASS on all four nodes."
+fi
+
+# =============================================================================
 # Start the proxy
 # =============================================================================
 # After both roles are healthy, so a proxy health failure means the proxy and
@@ -1207,6 +1284,7 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
     echo "      GPUS=$(( DP * TP * 2 )) \\"
     echo "      BASE_URL=http://${PROXY_IP}:${PROXY_PORT} \\"
     echo "      METRICS_URLS=http://${P_HEAD_IP}:${P_PORT},http://${D_HEAD_IP}:${D_PORT} \\"
+    echo "      CXI_NODES=${NODE_P_HEAD},${NODE_P_TAIL},${NODE_D_HEAD},${NODE_D_TAIL} \\"
     echo "      WORKLOAD=${WORKLOAD} \\"
     echo "      MAX_CONCURRENCY=64 NUM_PROMPTS=256 \\"
     echo "      RUN_DIR=${SHARED} \\"
@@ -1220,13 +1298,20 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
     echo "  lifting that ceiling should show. Run c=16 and c=32 too, for the"
     echo "  curve."
     echo ""
-    echo "  GPUS=$(( DP * TP * 2 )) IS REQUIRED AND FAILS QUIETLY. bench_arm.sh:78"
-    echo "  defaults ARM=disagg to 8, written for Nemotron's 1P+1D at TP=4 on"
-    echo "  two nodes. This arm serves $(( DP * TP * 2 )), so the default would report every"
+    echo "  GPUS AND MODEL ARE BOTH REQUIRED -- bench_arm.sh now FATALs without"
+    echo "  them, and the values are in the block above. They used to default to"
+    echo "  the Nemotron shape and fail quietly: GPUS to 8, written for 1P+1D at"
+    echo "  TP=4 on two nodes, which on this arm's $(( DP * TP * 2 )) would have reported every"
     echo "  per-GPU number at 2x -- in the favourable direction, in the figure"
-    echo "  the whole study turns on. MODEL defaults to the Nemotron repo id"
-    echo "  (:32), which is an HTTP 400 per request -- instant, so it reads on"
-    echo "  the progress bar as a fast run rather than as a fault."
+    echo "  the whole study turns on; MODEL to the Nemotron repo id, whose"
+    echo "  tokenizer builds the random prompts, so ISL was not ISL at the server."
+    echo ""
+    echo "  CXI_NODES IS ALL FOUR SERVING NODES, heads AND headless. bench_arm.sh"
+    echo "  reads hni_sts_{tx,rx}_ok_octets before and after the measured run; the"
+    echo "  counters are cumulative and dwarf the payload, so a single read after"
+    echo "  the fact cannot see the transfer and there is no way to recover it"
+    echo "  later. Omitting a headless node drops its half of the expert"
+    echo "  all-to-all, which is ~98.8% of fabric traffic (DECISIONS_2026-09-16c)."
     echo ""
     echo "  BASE_URL IS THE PROXY, METRICS_URLS ARE THE TWO HEADS. The proxy has"
     echo "  no /metrics of its own, and the counters that matter (nixl_*,"

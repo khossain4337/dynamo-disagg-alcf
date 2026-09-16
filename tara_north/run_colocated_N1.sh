@@ -582,6 +582,8 @@ if [ "${KEEP_ALIVE}" = "1" ]; then
     echo "      source ${SHARED}/common_env.sh"
     echo ""
     echo "      ARM=colocated \\"
+    echo "      MODEL=${MODEL} \\"
+    echo "      GPUS=${TP} \\"
     echo "      BASE_URL=http://${IP}:${PORT} \\"
     echo "      RUN_DIR=${SHARED} \\"
     echo "          bash ${SCRIPT_DIR}/bench_arm.sh"

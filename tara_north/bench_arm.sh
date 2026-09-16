@@ -29,7 +29,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARM=${ARM:?set ARM to a label, e.g. disagg|colocated|d-direct}
 BASE_URL=${BASE_URL:?set BASE_URL to the endpoint under test}
 METRICS_URLS=${METRICS_URLS:-${BASE_URL}}
-MODEL=${MODEL:-nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16}
+# No default. The Nemotron repo id used to be one, and on an Inkling run it
+# silently selects the wrong tokenizer for --dataset-name random, so the prompts
+# are not ISL tokens long at the server and the workload stops being the one the
+# other arm ran. Pass it explicitly; every launcher banner prints it.
+MODEL=${MODEL:?set MODEL -- no default; a wrong tokenizer retokenizes the workload silently}
 
 # --- Locked workload. Do not vary these between arms. -------------------------
 # The numbers, and the argument for each, live in workload_profile.sh -- the ONE
@@ -72,12 +76,19 @@ MAX_CONCURRENCY=${MAX_CONCURRENCY:-${WL_MAX_CONCURRENCY}}
 SLO_TTFT_MS=${SLO_TTFT_MS:-${WL_SLO_TTFT_MS}}
 SLO_ITL_P95_MS=${SLO_ITL_P95_MS:-${WL_SLO_ITL_P95_MS}}
 # For the per-GPU normalization. The blog's Figure 2 normalizes throughput per
-# GPU, which is what lets a 4-GPU colocated arm be compared with an 8-GPU
-# disagg one at all (CLOSED.md).
-case "${ARM}" in
-    disagg) GPUS=${GPUS:-8} ;;      # 1P + 1D, TP=4 each
-    *)      GPUS=${GPUS:-4} ;;      # colocated, or D benched directly
-esac
+# GPU, which is what lets a colocated arm be compared with a disagg one holding
+# more GPUs at all (CLOSED.md).
+#
+# No default. GPUS is a property of the launch shape -- DP x TP x roles -- which
+# this script never sees. The old defaults were the Nemotron shape (TP=4: 4
+# colocated, 8 for 1P+1D); Inkling is DP2 x TP4 per role, so 8 and 16. Inheriting
+# the Nemotron value on an Inkling run doubles tok/s/GPU, quietly, on the exact
+# axis Figure 2 is drawn against -- and if only one arm is passed the flag, the
+# comparison between them is 2x wrong rather than merely rescaled.
+#
+#     Inkling    colocated 8    disagg 16    d-direct 8
+#     Nemotron   colocated 4    disagg  8    d-direct 4
+GPUS=${GPUS:?set GPUS -- no default; Inkling 8 colocated / 16 disagg, Nemotron 4 / 8}
 
 # --- Warmup ------------------------------------------------------------------
 # jit_monitor warns that Triton compiles _causal_conv1d_fwd_kernel and
@@ -327,6 +338,25 @@ snapshot_metrics() {
     done
 }
 
+# --- Preflight 3: does every METRICS_URLS endpoint actually serve vLLM counters?
+# METRICS_URLS defaults to BASE_URL (:31), which on the disagg arm is
+# toy_proxy_server.py -- no /metrics at all. The first Inkling disagg c=64 lost
+# every engine-side number that way, and it is unrecoverable after the run.
+# Probing beats checking the ARM label: it also catches a typo, a wrong port and
+# a head that came up without a frontend, on every arm rather than one.
+for u in ${METRICS_URLS//,/ }; do
+    if ! curl -sf --max-time 10 "${u}/metrics" 2>/dev/null | grep -q '^vllm:'; then
+        echo "FATAL: ${u}/metrics served no 'vllm:' lines." >&2
+        echo "  METRICS_URLS defaults to BASE_URL, and on the disagg arm BASE_URL" >&2
+        echo "  is the proxy, which serves no /metrics (CLOSED.md). Point it at" >&2
+        echo "  the P and D heads directly:" >&2
+        echo "      METRICS_URLS=http://<P_IP>:8100,http://<D_IP>:8200" >&2
+        echo "  Every engine-side number is lost if this run proceeds." >&2
+        exit 1
+    fi
+done
+echo "  preflight   ${METRICS_URLS} serving vllm: counters"
+
 run_bench() {
     local label=$1 n=$2 osl=$3 outfile=$4
     vllm bench serve \
@@ -368,11 +398,53 @@ if [ "${WARMUP_PROMPTS}" -gt 0 ]; then
     fi
 fi
 
+# --- CXI octet counters, bracketing the measured run --------------------------
+# The wire half of the transfer evidence. /proc/net/dev cannot see it -- CXI RDMA
+# is kernel-bypass -- so the only instrument is the NIC's own telemetry:
+#   /sys/class/cxi/cxi<0-3>/device/telemetry/hni_sts_{tx,rx}_ok_octets
+#
+# A PAIR, not a single read: the counters are cumulative since NIC init and read
+# 9,000-45,000 GB per device against a ~277 GB run payload, so one read puts the
+# payload inside the history and cannot see it (CLOSED.md, tried 2026-09-16).
+#
+# A pair, not the Nemotron 20 Hz poller (run_pd_nemotron_1p1d_N2.sh:1398-1411):
+# two samples is the minimum AND it is sufficient -- two pairs taken during c=128
+# agreed on every ratio (DECISIONS_2026-09-16c.md). The poller's stop-marker and
+# setsid/nohup survival machinery exists to bound a window by hand; here the
+# window is exactly the measured run, which this script already brackets.
+#
+# CXI_NODES must name every SERVING node, headless ones included -- METRICS_URLS
+# names only the heads, and the headless node carries its own half of the expert
+# all-to-all. Unset, the sample is skipped and said so out loud.
+snapshot_cxi() {
+    local phase=$1 node out
+    [ -n "${CXI_NODES:-}" ] || return 0
+    out="${OUT_DIR}/cxi_${phase}.csv"
+    : > "${out}"
+    for node in ${CXI_NODES//,/ }; do
+        ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${node}" '
+            for i in 0 1 2 3; do
+                t=/sys/class/cxi/cxi${i}/device/telemetry
+                echo "$(date +%s.%N),cxi${i},$(cat ${t}/hni_sts_tx_ok_octets 2>/dev/null || echo NA),$(cat ${t}/hni_sts_rx_ok_octets 2>/dev/null || echo NA)"
+            done' 2>/dev/null | sed "s/^/${node},/" >> "${out}" \
+            || echo "  WARN: CXI read failed on ${node} at ${phase}" >&2
+    done
+}
+
+if [ -n "${CXI_NODES:-}" ]; then
+    echo "  cxi         sampling ${CXI_NODES}"
+else
+    echo "  cxi         SKIPPED -- set CXI_NODES to every serving node (heads AND"
+    echo "              headless) for the fabric half. Not recoverable after the run."
+fi
+
 # --- Measured run -------------------------------------------------------------
 snapshot_metrics before
+snapshot_cxi before
 echo "--- measured run (${NUM_PROMPTS} prompts) ---"
 run_bench measured "${NUM_PROMPTS}" "${OSL}" "${OUT_DIR}/result.json"
 BENCH_RC=$?
+snapshot_cxi after
 snapshot_metrics after
 
 # --- Evidence the client cannot see -------------------------------------------
@@ -404,6 +476,31 @@ for u in ${METRICS_URLS//,/ }; do
         printf '     %-58s %14s -> %-14s\n' "${name##vllm:}" "${vb:-0}" "${va:-0}"
     done
 done
+
+# --- CXI deltas, GB per rail --------------------------------------------------
+# Reported so the fabric half does not have to be reconstructed by hand, as
+# DECISIONS_2026-09-16c.md was. Read it for SHARE, not for bytes: the dominant
+# traffic is the expert all-to-all (~98.8% on 2026-09-16), KV is the remainder,
+# and the symmetric-exchange subtraction that isolates KV is a small difference
+# between two ~370 GB numbers. NEVER quote the KV residual -- use
+# nixl_bytes_transferred_sum above, which is exact and reproduces to the byte.
+# Egress concentrating on one rail while ingress spreads four ways is expected
+# and is not a fault (same file): record it, do not chase it.
+if [ -f "${OUT_DIR}/cxi_before.csv" ] && [ -f "${OUT_DIR}/cxi_after.csv" ]; then
+    echo ""
+    echo "=== CXI octet deltas, GB per rail ==="
+    awk -F, '
+        FNR==NR { tx[$1","$2]=$4; rx[$1","$2]=$5; t0[$1]=$3; next }
+        {
+            k=$1","$2
+            if (!(k in tx) || $4=="NA" || tx[k]=="NA") next
+            dt=($4-tx[k])/1e9; dr=($5-rx[k])/1e9; el=$3-t0[$1]
+            printf "     %-22s %-6s tx %9.1f   rx %9.1f   (%.0f s)\n", $1, $2, dt, dr, el
+            TX[$1]+=dt; RX[$1]+=dr
+        }
+        END { for (n in TX) printf "     %-22s %-6s tx %9.1f   rx %9.1f\n", n, "TOTAL", TX[n], RX[n] }
+    ' "${OUT_DIR}/cxi_before.csv" "${OUT_DIR}/cxi_after.csv" | sort
+fi
 
 echo ""
 echo "  Sanity: with --ignore-eos, generation_tokens_total must move by"
