@@ -94,6 +94,17 @@ mkdir -p "\${TRITON_CACHE_DIR}" "\${VLLM_CACHE_ROOT}" 2>/dev/null || true
 # launch produced an INFO log (2026-09-15). INFO stays the default -- DEBUG is
 # a diagnostic, never a measured run.
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
+# Engine-core ready timeout. vLLM defaults to 600 s (envs.py:27, :788); the API
+# servers raise TimeoutError from core_client.py:653-666 when any rank has not
+# sent its ready message by then. The Inkling colocated launch of 2026-09-16
+# died there at 715 s with the weights ALREADY RESIDENT -- 532 GB of weights,
+# the audio encoder profile and CUDA-graph capture do not fit in 600 s on this
+# rig, and a head cannot come up until BOTH DP ranks have registered, so the
+# slower rank sets the clock. Startup only: it changes no measured quantity and
+# does not touch the KV pool, so unlike --gpu-memory-utilization it does not
+# void a repeat. Expanded at emit time, so a one-off from the launching shell
+# still wins.
+export VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_S:-2400}
 ${UCX_LINES}
 ${GPU_PIN_LINE}
 EOF
