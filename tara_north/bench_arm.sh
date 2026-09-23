@@ -344,18 +344,51 @@ snapshot_metrics() {
 # every engine-side number that way, and it is unrecoverable after the run.
 # Probing beats checking the ARM label: it also catches a typo, a wrong port and
 # a head that came up without a frontend, on every arm rather than one.
+#
+# Scrape to a FILE, then grep it -- never `curl ... | grep -q`. grep -q exits on
+# the first match and closes the pipe; /metrics is ~200 KB, so curl dies of
+# SIGPIPE with exit 23 and `set -o pipefail` (:2) reports the pipeline as failed
+# on a perfectly healthy endpoint. That is not hypothetical: on 2026-09-23 this
+# guard FATALed on P while the same URL, seconds later, served 788 'vllm:' lines
+# (DECISIONS_2026-09-23.md). The scrape is kept as provenance -- it is also the
+# only record of how large /metrics actually is on a given run.
 for u in ${METRICS_URLS//,/ }; do
-    if ! curl -sf --max-time 10 "${u}/metrics" 2>/dev/null | grep -q '^vllm:'; then
+    _tag=$(echo "${u}" | tr -c 'A-Za-z0-9' '_')
+    _probe="${OUT_DIR}/metrics_preflight_${_tag}.txt"
+    # Pre-create: curl leaves no -o file at all when the connection never opens,
+    # and the `wc -c <` below would then print a shell redirection error into the
+    # middle of the FATAL block.
+    : > "${_probe}"
+    _code=$(curl -s -o "${_probe}" -w '%{http_code}' --max-time 10 "${u}/metrics" 2>/dev/null) || _code=000
+    _bytes=$(wc -c < "${_probe}" 2>/dev/null | tr -d ' '); _bytes=${_bytes:-0}
+    _nvllm=$(grep -c '^vllm:' "${_probe}" 2>/dev/null || true); _nvllm=${_nvllm:-0}
+    if [ "${_nvllm}" -eq 0 ]; then
+        # Report what was OBSERVED. The old message asserted a single cause --
+        # "METRICS_URLS defaults to BASE_URL" -- which was provably false in the
+        # 09-23 case, where it had been passed explicitly. Three distinct faults
+        # used to print one sentence.
         echo "FATAL: ${u}/metrics served no 'vllm:' lines." >&2
-        echo "  METRICS_URLS defaults to BASE_URL, and on the disagg arm BASE_URL" >&2
-        echo "  is the proxy, which serves no /metrics (CLOSED.md). Point it at" >&2
-        echo "  the P and D heads directly:" >&2
+        case "${_code}" in
+            000) echo "  Observed: no HTTP response within --max-time 10 -- unreachable," >&2
+                 echo "            connection refused, or timed out. Check the host:port is" >&2
+                 echo "            the engine head from run_config.txt, and that no_proxy" >&2
+                 echo "            carries its IP." >&2 ;;
+            200) echo "  Observed: HTTP 200, ${_bytes} bytes, zero lines matching '^vllm:'." >&2
+                 echo "            The endpoint answered but is not a vLLM frontend -- on the" >&2
+                 echo "            disagg arm this is the classic symptom of pointing at the" >&2
+                 echo "            proxy (toy_proxy_server.py serves no /metrics, CLOSED.md)." >&2 ;;
+            *)   echo "  Observed: HTTP ${_code}, ${_bytes} bytes of body -- wrong port, or a" >&2
+                 echo "            head that came up without a frontend." >&2 ;;
+        esac
+        echo "  Scrape kept at ${_probe}" >&2
+        echo "  METRICS_URLS is currently: ${METRICS_URLS}" >&2
+        echo "  It must name the P and D heads directly, e.g.:" >&2
         echo "      METRICS_URLS=http://<P_IP>:8100,http://<D_IP>:8200" >&2
         echo "  Every engine-side number is lost if this run proceeds." >&2
         exit 1
     fi
+    echo "  preflight   ${u}/metrics  HTTP ${_code}, ${_bytes} bytes, ${_nvllm} vllm: lines"
 done
-echo "  preflight   ${METRICS_URLS} serving vllm: counters"
 
 run_bench() {
     local label=$1 n=$2 osl=$3 outfile=$4

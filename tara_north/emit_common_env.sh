@@ -60,6 +60,28 @@ export PYTHONNOUSERSITE=1
 export HF_HOME=/vast/draco/tara/projects/Tara_Deployment/software/model-weights
 export HF_DATASETS_CACHE=\${HF_HOME}
 export HF_MODULES_CACHE=\${HF_HOME}
+# NO OUTBOUND CALLS AT ENGINE START. Same argument as the node-local compiler
+# caches below: a launch must not depend on anything off the node that it does
+# not already have. The weights are wholly cached under HF_HOME on /vast, so
+# every remote call here is a liveness check with nothing to fetch -- and one of
+# them took an API server down. On 2026-09-23 huggingface_hub list_repo_tree
+# (hf_api.py:4100 -> _pagination.py:36) raised
+# httpcore.RemoteProtocolError: Server disconnected: the ALCF proxy dropped a
+# paginated remote directory crawl. --api-server-count 16 is the amplifier --
+# sixteen servers each crawling -- which is why it had never bitten before and
+# is intermittent now. The proxy is configured correctly above and NO_PROXY_LIST
+# covers every node; the call was genuinely external, so the fix is to not make
+# it (DECISIONS_2026-09-23.md).
+#
+# If a model is ever NOT fully cached, these turn a slow download into a clean
+# immediate failure -- which is the behaviour you want on a timed allocation.
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+# Same class, not the same incident: an outbound usage POST at engine start, and
+# a \$HOME write under ~/.config/vllm, which the "never write to \$HOME" rule
+# below forbids on its own.
+export VLLM_NO_USAGE_STATS=1
+export DO_NOT_TRACK=1
 export RAY_TMPDIR=/tmp
 export TMPDIR=/tmp
 # COMPILER CACHES MUST BE NODE-LOCAL. Unset, these default under \$HOME, which
