@@ -14,10 +14,9 @@ from datetime import datetime
 from itertools import product
 from typing import Any, TypedDict
 
-import ray
 import torch
 import vllm
-from ray.experimental.tqdm_ray import tqdm
+from tqdm import tqdm
 
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -523,16 +522,13 @@ def merge_unique_dicts(list1, list2):
     return result
 
 
-@ray.remote(num_gpus=1)
 class BenchmarkWorker:
     def __init__(self, seed: int) -> None:
         torch.set_default_device("cuda")
         set_random_seed(seed)
         self.seed = seed
-        # Get the device ID to allocate tensors and kernels
-        # on the respective GPU. This is required for Ray to work
-        # correctly with multi-GPU tuning on the ROCm platform.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        # One GPU per process via CUDA_VISIBLE_DEVICES, so always local 0.
+        self.device_id = 0
 
     def benchmark(
         self,
@@ -548,7 +544,6 @@ class BenchmarkWorker:
         block_quant_shape: list[int] = None,
         use_deep_gemm: bool = False,
     ) -> tuple[dict[str, int], float]:
-        # local import to allow serialization by ray
 
         set_random_seed(self.seed)
         dtype_str = _get_config_dtype_str(
@@ -608,7 +603,6 @@ class BenchmarkWorker:
         block_quant_shape: list[int],
         use_deep_gemm: bool,
     ) -> dict[str, int]:
-        # local import to allow serialization by ray
         from vllm.platforms import current_platform
 
         best_config = None
@@ -980,20 +974,10 @@ def main(args: argparse.Namespace):
         os.environ["ROCR_VISIBLE_DEVICES"] = val
         del os.environ["HIP_VISIBLE_DEVICES"]
 
-    ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
+    worker = BenchmarkWorker(args.seed)
 
     def _distribute(method: str, inputs: list[Any]) -> list[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
+        return [getattr(worker, method)(*input_args) for input_args in inputs]
 
     if args.tune:
         # int4_w4a16 weights are uint8-packed, not fp16; treat like fp8 for
