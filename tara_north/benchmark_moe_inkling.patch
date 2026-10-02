@@ -1,0 +1,72 @@
+--- vllm-v0.27.1/vllm/benchmarks/kernels/benchmark_moe.py	2026-09-08 09:09:29
++++ dynamo-disagg-alcf/tara_north/benchmark_moe_inkling.py	2026-10-02 12:24:14
+@@ -1,5 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
++# Fork of vllm/benchmarks/kernels/benchmark_moe.py (vLLM 0.27.1).
++# Changes: benchmark_moe_inkling.patch. Usage: DECISIONS_2026-10-02c.md.
+ 
+ import argparse
+ import gc
+@@ -13,6 +16,7 @@
+ 
+ import ray
+ import torch
++import vllm
+ from ray.experimental.tqdm_ray import tqdm
+ 
+ from vllm.model_executor.layers.fused_moe import fused_topk
+@@ -811,6 +815,14 @@
+         topk = config.thinker_config.text_config.num_experts_per_tok
+         intermediate_size = config.thinker_config.text_config.moe_intermediate_size
+         hidden_size = config.thinker_config.text_config.hidden_size
++    elif architecture in ("InklingForConditionalGeneration", "InklingModelConfig"):
++        # Inkling: n_routed_experts, and intermediate_size is the MoE width
++        # (dense_intermediate_size is the dense layers').
++        text_config = config.get_text_config()
++        E = text_config.n_routed_experts
++        topk = text_config.num_experts_per_tok
++        intermediate_size = text_config.intermediate_size
++        hidden_size = text_config.hidden_size
+     elif architecture == "PixtralForConditionalGeneration":
+         # Pixtral can contain different LLM architectures,
+         # recurse to get their parameters
+@@ -878,6 +890,9 @@
+ def main(args: argparse.Namespace):
+     print(args)
+ 
++    if vllm.__version__ != "0.27.1" and not os.environ.get("ALLOW_VLLM_SKEW"):
++        raise SystemExit(f"fork targets vLLM 0.27.1, found {vllm.__version__}")
++
+     config = get_config(model=args.model, trust_remote_code=args.trust_remote_code)
+     if args.model_prefix:
+         config = getattr(config, args.model_prefix)
+@@ -907,6 +922,27 @@
+         # For int4_w4a16, block_shape = [0, group_size]
+         # block_shape[0]=0 means no block quantization on N dimension
+         block_quant_shape = [0, group_size]
++
++    # Shape echo: E and N name the file vLLM looks for, so a run without
++    # --tune proves the derivation in a minute.
++    print(
++        f"shape: E={E} topk={topk} hidden={hidden_size} "
++        f"shard_intermediate={shard_intermediate_size} dtype={dtype}"
++    )
++    print(
++        "config file:",
++        get_config_file_name(
++            E,
++            shard_intermediate_size // 2,
++            _get_config_dtype_str(
++                dtype,
++                use_int8_w8a16=use_int8_w8a16,
++                use_fp8_w8a8=use_fp8_w8a8,
++                use_int4_w4a16=use_int4_w4a16,
++            ),
++            block_quant_shape,
++        ),
++    )
+ 
+     if args.batch_size is None:
+         batch_sizes = [
