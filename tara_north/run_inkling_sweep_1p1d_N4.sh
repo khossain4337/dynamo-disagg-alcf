@@ -433,10 +433,12 @@ tail -n +1 -f "${SHARED}/logs/d-head.log"     > >(sed -u 's/^/[D-HEAD] /') & TAI
 tail -n +1 -f "${SHARED}/logs/d-headless.log" > >(sed -u 's/^/[D-TAIL] /') & TAIL_DT_PID=$!; disown ${TAIL_DT_PID}
 tail -n +1 -f "${SHARED}/logs/mpiexec.log"    > >(sed -u 's/^/[MPI]    /') & TAIL_M_PID=$!; disown ${TAIL_M_PID}
 
-# This one string only. 'init_device' appears 12-16 times in a HEALTHY log, so
-# matching it would rotate a good node on any slow startup.
+# These two strings only. 'init_device' appears 12-16 times in a HEALTHY log, so
+# matching it would rotate a good node on any slow startup. Both of these are
+# fatal lines that cannot occur in a healthy log.
 dirty_signature() {
-    grep -lF 'No available memory for the cache blocks' "${SHARED}"/logs/[pd]-head*.log 2>/dev/null
+    grep -lE 'No available memory for the cache blocks|Free memory on device cuda' \
+        "${SHARED}"/logs/[pd]-head*.log 2>/dev/null
 }
 
 wait_healthy() {

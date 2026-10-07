@@ -285,11 +285,11 @@ tail -n +1 -f "${SHARED}/logs/mpiexec.log"  > >(sed -u 's/^/[MPI]  /') & TAIL_M_
 # reliable detector, so the log is. Remedy all three times was to give that node
 # the client role -- hence the DIRTY_NODE line and exit 10.
 #
-# This one string only. 'init_device' appears 12-16 times in a HEALTHY log, so
+# These two strings only. 'init_device' appears 12-16 times in a HEALTHY log, so
 # matching it would rotate a good node on any slow startup. Under-detecting is
 # the safe direction: an unmatched failure exits 1 and a human reads the log.
 dirty_signature() {
-    grep -lF 'No available memory for the cache blocks' \
+    grep -lE 'No available memory for the cache blocks|Free memory on device cuda' \
         "${SHARED}/logs/head.log" "${SHARED}/logs/headless.log" 2>/dev/null
 }
 
