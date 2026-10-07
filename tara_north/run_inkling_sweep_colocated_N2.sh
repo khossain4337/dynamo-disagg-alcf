@@ -275,9 +275,11 @@ mpiexec -n "${DP}" -ppn 1 --hosts "${NODE_HEAD},${NODE_TAIL}" \
     bash "${SHARED}/launch_role.sh" > "${SHARED}/logs/mpiexec.log" 2>&1 &
 MPIEXEC_PID=$!
 
-tail -n +1 -f "${SHARED}/logs/head.log"     | sed -u 's/^/[HEAD] /' & TAIL_H_PID=$!; disown ${TAIL_H_PID}
-tail -n +1 -f "${SHARED}/logs/headless.log" | sed -u 's/^/[TAIL] /' & TAIL_T_PID=$!; disown ${TAIL_T_PID}
-tail -n +1 -f "${SHARED}/logs/mpiexec.log"  | sed -u 's/^/[MPI]  /' & TAIL_M_PID=$!; disown ${TAIL_M_PID}
+# $! on a pipeline names its LAST member, so `| sed` captured sed and the tails
+# outlived the kill, dying on EPIPE. Process substitution keeps $! as tail.
+tail -n +1 -f "${SHARED}/logs/head.log"     > >(sed -u 's/^/[HEAD] /') & TAIL_H_PID=$!; disown ${TAIL_H_PID}
+tail -n +1 -f "${SHARED}/logs/headless.log" > >(sed -u 's/^/[TAIL] /') & TAIL_T_PID=$!; disown ${TAIL_T_PID}
+tail -n +1 -f "${SHARED}/logs/mpiexec.log"  > >(sed -u 's/^/[MPI]  /') & TAIL_M_PID=$!; disown ${TAIL_M_PID}
 
 # A node can read 0 MiB and still fail init_device (-16d); memory is not a
 # reliable detector, so the log is. Remedy all three times was to give that node
