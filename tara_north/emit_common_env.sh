@@ -34,6 +34,11 @@
 emit_common_env() {
     local _dest=${1:?emit_common_env: destination path required}
 
+# An unset input dies inside the unquoted heredoc AFTER `>` truncated the file;
+# the quoted one then appends over the wreckage. Half a file, exit 0. `?` not
+# `:?` -- UCX_LINES and GPU_PIN_LINE are legitimately empty.
+: "${NO_PROXY_LIST?}" "${ENV_SCRIPT?}" "${UCX_LINES?}" "${GPU_PIN_LINE?}"
+
 cat > ${_dest} <<EOF
 export HTTP_PROXY=http://proxy.alcf.anl.gov:3128
 export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128

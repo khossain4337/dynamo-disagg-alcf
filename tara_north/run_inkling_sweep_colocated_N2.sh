@@ -13,6 +13,11 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Also in common_env.sh; set here too so they hold even if that file is wrong,
+# and so the launch line needs no env prefix. mpiexec forwards them to the
+# server. Standing constraints -- HANDOFF.
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
+
 ISL=${ISL:?set ISL}
 OSL=${OSL:?set OSL}
 #CONCURRENCIES=${CONCURRENCIES:-4 8 16 32 64 128}
@@ -143,11 +148,12 @@ fi
 # The client node is in no_proxy too: the bench runs there, and without it curl
 # to an hsn0 address returns a Squid page that reads as a dead server.
 NO_PROXY_LIST="localhost,127.0.0.1,${HEAD_IP},${TAIL_IP},${CLIENT_IP},${NODE_HEAD},${NODE_TAIL},${NODE_HEAD_SHORT},${NODE_TAIL_SHORT},${CLIENT_HOST}"
+ENV_SCRIPT="${SCRIPT_DIR}/env_for_libfabric_topology_error.sh"
 UCX_LINES=""
 GPU_PIN_LINE=""
 # shellcheck source=./emit_common_env.sh
 source "${SCRIPT_DIR}/emit_common_env.sh"
-emit_common_env "${SHARED}/common_env.sh"
+emit_common_env "${SHARED}/common_env.sh" || exit 1
 # shellcheck source=./emit_conn_sampler.sh
 source "${SCRIPT_DIR}/emit_conn_sampler.sh"
 emit_conn_sampler "${SHARED}/sample_conns.sh"
@@ -336,6 +342,11 @@ elif [ -n "${EXPECT_POOL:-}" ]; then
 else
     echo "pool ${_pool} -- no EXPECT_POOL set; pass this on subsequent colocated launches."
 fi
+
+# Unattended: nothing else gives this shell $no_proxy (bench_arm.sh preflight 0
+# hard-fails without it) or HF_HOME for the tokenizer load. After the servers
+# are up, so the launcher's CC/CXX never reach them.
+source "${SHARED}/common_env.sh"
 
 # This arm is not a baseline if a connector is attached.
 if grep -qiE 'NixlConnector|kv_transfer_config|KVConnector' "${SHARED}/logs/head.log"; then
