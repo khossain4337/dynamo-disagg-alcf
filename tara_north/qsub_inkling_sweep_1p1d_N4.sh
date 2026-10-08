@@ -80,5 +80,7 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
     fi
 done
 
+# TODO still holds the list the last attempt ran; only exit 30 trims it.
+[ "$RC" -eq 0 ] && TODO=
 echo "=== exit_code=${RC}  parked=${PARKED:-none}  unfinished=${TODO:-none} ==="
 exit "$RC"
