@@ -18,7 +18,7 @@ MAX_ATTEMPTS=3
 API_SERVER_COUNT=4
 ISL=1024
 OSL=256
-CONCURRENCIES="4"
+CONCURRENCIES="4 8 16 32 64 128"
 
 # PBS_NODEFILE is set only on the mother superior and lives under its local
 # /var/spool. Staging it to /vast is what lets the run script be launched from
