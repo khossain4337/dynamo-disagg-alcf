@@ -22,9 +22,9 @@ OSL=256
 ISL_LIST="1024 2048 4096 8192 16384 32768"
 CONCURRENCIES="4 8 16 32 64 128"
 # Pinned for the whole plane, not the run script's per-pair ISL+OSL+8192.
-# 32768+4096+8192 covers every phase-1 and phase-3 pair. A per-pair mml moves
-# the KV pool with it and no two cells compare.
-MAX_MODEL_LEN=45056
+# 32768+32768+8192 covers all 48 pairs. A per-pair mml moves the KV pool with
+# it and no two cells compare: mml 9472/45056/73728 measured D 124k/513k/757k.
+MAX_MODEL_LEN=73728
 
 # PBS_NODEFILE is set only on the mother superior and lives under its local
 # /var/spool. Staging it to /vast is what lets the run script be launched from
@@ -66,7 +66,7 @@ for ISL in $ISL_LIST; do
     TODO="$CONCURRENCIES"
     FATAL=
     for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-        LOG="${NODEFILE_DIR}/qsub_${PBS_JOBID}_isl${ISL}_a${attempt}.log"
+        LOG="${NODEFILE_DIR}/qsub_${PBS_JOBID}_isl${ISL}_osl${OSL}_mml${MAX_MODEL_LEN}_a${attempt}.log"
         echo "=== isl=${ISL} osl=${OSL} attempt ${attempt}/${MAX_ATTEMPTS}  client=${CLIENT}  concurrencies=${TODO} ==="
         launch "$CLIENT" "$TODO" 2>&1 | tee "$LOG"
         RC=${PIPESTATUS[0]}        # $? is tee's

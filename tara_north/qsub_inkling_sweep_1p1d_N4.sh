@@ -52,7 +52,7 @@ TODO="$CONCURRENCIES"
 #   11 pool gate      | 30 a server died mid-ladder
 # Named RC because the run script calls it RC too. Every branch below tests it.
 for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-    LOG="${NODEFILE_DIR}/qsub_${PBS_JOBID}_a${attempt}.log"
+    LOG="${NODEFILE_DIR}/qsub_${PBS_JOBID}_isl${ISL}_osl${OSL}_mml${MAX_MODEL_LEN}_a${attempt}.log"
     echo "=== attempt ${attempt}/${MAX_ATTEMPTS}  client=${CLIENT}  concurrencies=${TODO} ==="
     launch "$CLIENT" "$TODO" 2>&1 | tee "$LOG"
     RC=${PIPESTATUS[0]}        # $? is tee's
