@@ -1,10 +1,10 @@
 #!/bin/bash
-#PBS -l select=6:tier1=x4820c4 -l place=scatter:group=tier1
-#PBS -l walltime=11:59:00
+#PBS -l select=6:tier1=x4820c7 -l place=scatter:group=tier1
+#PBS -l walltime=24:00:00
 #PBS -A inference_service
 #PBS -q workq
 #PBS -k doe
-#PBS -N d-256
+#PBS -N d-2048
 #PBS -o /vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS/outdir_tara
 #PBS -e /vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS/errordir_tara
 #PBS -j oe
@@ -18,8 +18,8 @@ export TARA_NORTH NODEFILE_DIR
 MAX_ATTEMPTS=3
 [ "$MAX_ATTEMPTS" -ge 1 ] || { echo "MAX_ATTEMPTS must be >= 1" >&2; exit 1; }
 API_SERVER_COUNT=4
-OSL=256
-ISL_LIST="1024 2048 4096 8192 16384 32768"
+OSL=2048
+ISL_LIST="2048 4096 8192 16384 32768"
 CONCURRENCIES="4 8 16 32 64 128"
 # Pinned for the whole plane, not the run script's per-pair ISL+OSL+8192.
 # 32768+4096+8192 covers every phase-1 and phase-3 pair. A per-pair mml moves

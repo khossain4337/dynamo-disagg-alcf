@@ -98,7 +98,7 @@ KEEP_ALIVE_POLL_S=${KEEP_ALIVE_POLL_S:-300}
 
 RUNS_ROOT=${RUNS_ROOT:-/vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS}
 STAMP=$(date +%Y%m%d_%H%M%S)
-SHARED=${SHARED:-${RUNS_ROOT}/inkling_1p1d_dp${DP}tp${TP}_isl${ISL}_osl${OSL}_${STAMP}}
+SHARED=${SHARED:-${RUNS_ROOT}/inkling_1p1d_dp${DP}tp${TP}_isl${ISL}_osl${OSL}_mml${MAX_MODEL_LEN}_${STAMP}}
 
 # --- Model: resolved from the cache, because that also proves it is there -----
 HF_CACHE_ROOT=${HF_CACHE_ROOT:-/vast/draco/tara/projects/Tara_Deployment/software/model-weights/hub}
