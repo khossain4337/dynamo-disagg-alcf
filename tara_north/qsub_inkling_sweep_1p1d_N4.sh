@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -l select=6:tier1=x4820c2 -l place=scatter:group=tier1
+#PBS -l select=6:tier1=x4820c4 -l place=scatter:group=tier1
 #PBS -l walltime=11:59:00
 #PBS -A inference_service
 #PBS -q workq
