@@ -84,6 +84,10 @@ PROXY_SCRIPT=${PROXY_SCRIPT:-/vast/draco/tara/projects/Tara_Deployment/software/
 HEALTH_TRIES=${HEALTH_TRIES:-480}
 SAMPLE_INTERVAL_S=${SAMPLE_INTERVAL_S:-10}
 GPU_DIRTY_MIB=${GPU_DIRTY_MIB:-4096}
+# Default 1: the startup-memory failure cannot be scheduled, so the value is in
+# being armed when it happens. A PBS script exports 0 to silence it.
+GPU_WATCH=${GPU_WATCH:-1}
+GPU_WATCH_INTERVAL_S=${GPU_WATCH_INTERVAL_S:-1}
 # 0 for unattended: holding the nodes past the ladder blocks the next PBS job.
 # Set 1 when you are at the terminal and want to retry a failed cell by hand
 # without paying another startup.
@@ -168,7 +172,20 @@ echo "P ${NODE_P_HEAD_SHORT} ${P_HEAD_IP} / ${NODE_P_TAIL_SHORT} ${P_TAIL_IP}"
 echo "D ${NODE_D_HEAD_SHORT} ${D_HEAD_IP} / ${NODE_D_TAIL_SHORT} ${D_TAIL_IP}"
 echo "proxy ${NODE_PROXY_SHORT} ${PROXY_IP}$([ "${PROXY_ON_P_HEAD}" = "1" ] && echo '  (ON P HEAD -- degraded, record it)')"
 
-mkdir -p "${SHARED}/logs" || { echo "FATAL: cannot create ${SHARED}" >&2; exit 1; }
+# logs/nccl, not logs: NCCL will not create its own directory, and if it cannot
+# open NCCL_DEBUG_FILE it falls back to stdout SILENTLY.
+mkdir -p "${SHARED}/logs/nccl" || { echo "FATAL: cannot create ${SHARED}" >&2; exit 1; }
+
+# Launcher defaults, forwarded by mpiexec like the block at the top. Its own
+# files: NCCL writes unprefixed and collides with vLLM's prefixes, which is
+# what mangled the d-head KV line and lost the d-headless communicator count
+# (-10-07d). %h and %p are what keep eight ranks off one file on a shared
+# filesystem with no locking. ALLOC stays off -- chatty, eight ranks writing to
+# /vast, and confirmatory only; turn it on per run when a buffer size is
+# actually wanted (-10-07e).
+export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
+export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,GRAPH,TUNING}
+export NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE:-${SHARED}/logs/nccl/nccl.%h.%p.log}
 
 for f in fi_getinfo_shim.so env_for_libfabric_topology_error.sh gpu_cleanup.sh \
          emit_common_env.sh emit_conn_sampler.sh workload_profile.sh bench_arm.sh; do
@@ -380,8 +397,12 @@ chmod +x "${SHARED}/launch_proxy.sh"
 cat "${SHARED}/run_config.txt"
 
 SAMPLE_STOP_MARKER="${SHARED}/sample_stop_${STAMP}"
+GPU_WATCH_STOP_MARKER="${SHARED}/gpu_watch_stop_${STAMP}"
 cleanup() {
-    touch "${SAMPLE_STOP_MARKER}" 2>/dev/null
+    # The GPU marker is also touched at both-heads-healthy. This one only
+    # covers an abort before that point, which would otherwise leave four 1 Hz
+    # loops writing to /vast forever.
+    touch "${SAMPLE_STOP_MARKER}" "${GPU_WATCH_STOP_MARKER}" 2>/dev/null
     ssh -n "${NODE_PROXY}" "pkill -TERM -f \"${PAT_PROXY}\"" 2>/dev/null
     for n in "${ENGINE_NODES[@]}"; do
         ssh -n "$n" "pkill -TERM -f \"${PAT_VLLM}\"" 2>/dev/null
@@ -417,6 +438,27 @@ CPU_BIND_ARGS=()
 touch "${SHARED}/logs/p-head.log" "${SHARED}/logs/p-headless.log" \
       "${SHARED}/logs/d-head.log" "${SHARED}/logs/d-headless.log" \
       "${SHARED}/logs/mpiexec.log" "${SHARED}/logs/proxy.log"
+
+# --- GPU watcher: a 1 Hz memory trace per engine node, launch to both heads
+# healthy. It must not reach the ladder -- 1 Hz on a serving node adds jitter
+# against a ~42 ms clean step (-10-07c). The remote loop exits on its own when
+# it sees the marker, so there is no pid to kill and no backgrounded pipeline
+# whose $! would name the wrong process.
+if [ "${GPU_WATCH}" = "1" ]; then
+    cat > "${SHARED}/gpu_watch.sh" <<EOF
+#!/bin/bash
+while [ ! -f "${GPU_WATCH_STOP_MARKER}" ]; do
+    nvidia-smi --query-gpu=timestamp,index,memory.used,memory.total \\
+        --format=csv,noheader,nounits
+    sleep ${GPU_WATCH_INTERVAL_S}
+done
+EOF
+    for n in "${ENGINE_NODES[@]}"; do
+        ssh -n "$n" "setsid nohup bash ${SHARED}/gpu_watch.sh \
+            > ${SHARED}/logs/gpu_${n%%.*}.log 2>&1 < /dev/null &"
+    done
+fi
+
 # --hosts, not a bare -n: the allocation also holds the client and proxy nodes,
 # and -ppn 1 over all of them would start an engine on both.
 mpiexec -n "${NEED_ENGINE_NODES}" -ppn 1 \
@@ -433,11 +475,12 @@ tail -n +1 -f "${SHARED}/logs/d-head.log"     > >(sed -u 's/^/[D-HEAD] /') & TAI
 tail -n +1 -f "${SHARED}/logs/d-headless.log" > >(sed -u 's/^/[D-TAIL] /') & TAIL_DT_PID=$!; disown ${TAIL_DT_PID}
 tail -n +1 -f "${SHARED}/logs/mpiexec.log"    > >(sed -u 's/^/[MPI]    /') & TAIL_M_PID=$!; disown ${TAIL_M_PID}
 
-# These two strings only. 'init_device' appears 12-16 times in a HEALTHY log, so
-# matching it would rotate a good node on any slow startup. Both of these are
-# fatal lines that cannot occur in a healthy log.
+# This string alone, no alternation. It exists only in the raising path,
+# v1/worker/utils.py:418-427. 'Free memory on device cuda' matches the same
+# eight runs but would also match every healthy run if a vLLM bump ever added
+# the device id to the healthy INFO line (-10-07d).
 dirty_signature() {
-    grep -lE 'No available memory for the cache blocks|Free memory on device cuda' \
+    grep -lF 'is less than desired GPU memory utilization' \
         "${SHARED}"/logs/[pd]-head*.log 2>/dev/null
 }
 
@@ -475,6 +518,9 @@ wait_healthy() {
 _boot_fail=0
 wait_healthy "${D_HEAD_IP}" "${D_PORT}" "D head (${NODE_D_HEAD_SHORT})" /health d-head || _boot_fail=1
 [ "${_boot_fail}" -eq 0 ] && { wait_healthy "${P_HEAD_IP}" "${P_PORT}" "P head (${NODE_P_HEAD_SHORT})" /health p-head || _boot_fail=1; }
+# Here, not in cleanup: on a boot failure cleanup runs too, but on a healthy
+# boot the trap would not fire until after the ladder.
+touch "${GPU_WATCH_STOP_MARKER}" 2>/dev/null
 kill -TERM "${TAIL_PH_PID}" "${TAIL_PT_PID}" "${TAIL_DH_PID}" "${TAIL_DT_PID}" "${TAIL_M_PID}" 2>/dev/null
 if [ "${_boot_fail}" -ne 0 ]; then
     _sig=$(dirty_signature)
@@ -534,6 +580,15 @@ for _r in p-head d-head; do
     grep -qiE 'NixlConnector|kv_transfer_config|KVConnector' "${SHARED}/logs/${_r}.log" \
         || echo "WARNING: ${_r}.log never mentions a KV connector. Do not bench this." >&2
 done
+
+# Non-empty is the only proof the redirect took. NOT a count of four: %p is per
+# process, the head runs 16 API servers plus an engine core plus four workers,
+# and every process that touches NCCL gets a file -- expect a handful per node,
+# with the content in the worker files.
+if [ -z "$(find "${SHARED}/logs/nccl" -name 'nccl.*.log' -size +0c -print -quit 2>/dev/null)" ]; then
+    echo "WARNING: no non-empty file under logs/nccl -- NCCL_DEBUG_FILE did not" >&2
+    echo "         take and NCCL went to stdout, back into the role logs." >&2
+fi
 
 echo ""
 echo "=== KV cache groups ==="
