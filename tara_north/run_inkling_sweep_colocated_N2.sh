@@ -51,7 +51,7 @@ NUMA_BIND_NODES="${NUMA_BIND_NODES:-0 1 2 3}"            # indexed by GPU, space
 # Shared default with the disagg arm so the two agree by construction (THE ONE
 # RULE). Passed explicitly because omitting it is not 1 -- serve.py:121
 # silently substitutes data_parallel_size.
-API_SERVER_COUNT=${API_SERVER_COUNT:-16}
+API_SERVER_COUNT=${API_SERVER_COUNT:-4}                  # 2026-10-08b
 
 PORT=${PORT:-8100}
 DP_RPC_PORT=${DP_RPC_PORT:-29550}

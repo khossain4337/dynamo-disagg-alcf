@@ -59,7 +59,9 @@ NUMA_BIND=${NUMA_BIND:-1}
 NUMA_BIND_NODES="${NUMA_BIND_NODES:-0 1 2 3}"
 # Shared default with the colocated arm (THE ONE RULE). Passed explicitly
 # because omitting it is not 1 -- serve.py:121 substitutes data_parallel_size.
-API_SERVER_COUNT=${API_SERVER_COUNT:-16}
+# 4, not 16, from 2026-10-08b: 16 yields four effective servers anyway
+# (CLOSED.md:477) and its startup burst straddles the memory gate.
+API_SERVER_COUNT=${API_SERVER_COUNT:-4}
 
 NIXL_BACKEND=${NIXL_BACKEND:-LIBFABRIC}
 KV_LEASE_DURATION=${KV_LEASE_DURATION:-30}
