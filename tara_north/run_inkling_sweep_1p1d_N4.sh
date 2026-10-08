@@ -447,9 +447,14 @@ touch "${SHARED}/logs/p-head.log" "${SHARED}/logs/p-headless.log" \
 if [ "${GPU_WATCH}" = "1" ]; then
     cat > "${SHARED}/gpu_watch.sh" <<EOF
 #!/bin/bash
+# Two line types, tagged in column 1: 'dev' is per device, 'app' is per holding
+# process. 'app' often lists nothing even when 'dev' is GiB-scale -- the holder
+# can be a pid the caller cannot see (gpu_cleanup.sh:33-34).
 while [ ! -f "${GPU_WATCH_STOP_MARKER}" ]; do
     nvidia-smi --query-gpu=timestamp,index,memory.used,memory.total \\
-        --format=csv,noheader,nounits
+        --format=csv,noheader,nounits | sed 's/^/dev, /'
+    nvidia-smi --query-compute-apps=timestamp,pid,used_gpu_memory \\
+        --format=csv,noheader,nounits | sed 's/^/app, /'
     sleep ${GPU_WATCH_INTERVAL_S}
 done
 EOF
@@ -519,8 +524,16 @@ _boot_fail=0
 wait_healthy "${D_HEAD_IP}" "${D_PORT}" "D head (${NODE_D_HEAD_SHORT})" /health d-head || _boot_fail=1
 [ "${_boot_fail}" -eq 0 ] && { wait_healthy "${P_HEAD_IP}" "${P_PORT}" "P head (${NODE_P_HEAD_SHORT})" /health p-head || _boot_fail=1; }
 # Here, not in cleanup: on a boot failure cleanup runs too, but on a healthy
-# boot the trap would not fire until after the ladder.
+# boot the trap would not fire until after the ladder. The marker is only the
+# backstop -- it took ~50 s to propagate on /vast (2026-10-08) and the jitter
+# rule needs the watchers gone now. Full path, so a back-to-back relaunch does
+# not kill the other run's watcher.
 touch "${GPU_WATCH_STOP_MARKER}" 2>/dev/null
+if [ "${GPU_WATCH}" = "1" ]; then
+    for n in "${ENGINE_NODES[@]}"; do
+        ssh -n "$n" "pkill -f ${SHARED}/gpu_watch.sh" 2>/dev/null
+    done
+fi
 kill -TERM "${TAIL_PH_PID}" "${TAIL_PT_PID}" "${TAIL_DH_PID}" "${TAIL_DT_PID}" "${TAIL_M_PID}" 2>/dev/null
 if [ "${_boot_fail}" -ne 0 ]; then
     _sig=$(dirty_signature)
