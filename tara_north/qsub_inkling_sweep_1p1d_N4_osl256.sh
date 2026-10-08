@@ -4,7 +4,7 @@
 #PBS -A inference_service
 #PBS -q workq
 #PBS -k doe
-#PBS -N disagg
+#PBS -N d-256
 #PBS -o /vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS/outdir_tara
 #PBS -e /vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS/errordir_tara
 #PBS -j oe
