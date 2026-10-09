@@ -20,7 +20,6 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_NO_USAGE_STATS=1 DO_NOT_TRAC
 
 ISL=${ISL:?set ISL}
 OSL=${OSL:?set OSL}
-#CONCURRENCIES=${CONCURRENCIES:-4 8 16 32 64 128}
 CONCURRENCIES=${CONCURRENCIES:-16}
 PROMPTS_PER_STREAM=${PROMPTS_PER_STREAM:-4}          # num_prompts = 4c, CLOSED.md
 # 8192 of slack: --dataset-name random lands near ISL, not on it, and an exact
@@ -58,9 +57,13 @@ DP_RPC_PORT=${DP_RPC_PORT:-29550}
 HEALTH_TRIES=${HEALTH_TRIES:-480}                        # x5s = 40 min
 SAMPLE_INTERVAL_S=${SAMPLE_INTERVAL_S:-10}
 GPU_DIRTY_MIB=${GPU_DIRTY_MIB:-4096}
+# Default 1: the startup-memory failure cannot be scheduled, so the value is in
+# being armed when it happens. A PBS script exports 0 to silence it.
+GPU_WATCH=${GPU_WATCH:-1}
+GPU_WATCH_INTERVAL_S=${GPU_WATCH_INTERVAL_S:-1}
 RUNS_ROOT=${RUNS_ROOT:-/vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS}
 STAMP=$(date +%Y%m%d_%H%M%S)
-SHARED=${SHARED:-${RUNS_ROOT}/inkling_colocated_dp${DP}tp${TP}_isl${ISL}_osl${OSL}_${STAMP}}
+SHARED=${SHARED:-${RUNS_ROOT}/inkling_colocated_dp${DP}tp${TP}_isl${ISL}_osl${OSL}_mml${MAX_MODEL_LEN}_${STAMP}}
 
 # --- Model: resolved from the cache, because that also proves it is there -----
 HF_CACHE_ROOT=${HF_CACHE_ROOT:-/vast/draco/tara/projects/Tara_Deployment/software/model-weights/hub}
@@ -109,10 +112,20 @@ if [ -z "${HEAD_IP}" ] || [ -z "${TAIL_IP}" ] || [ -z "${CLIENT_IP}" ]; then
 fi
 echo "client ${CLIENT_HOST}  head ${NODE_HEAD_SHORT} ${HEAD_IP}  headless ${NODE_TAIL_SHORT} ${TAIL_IP}"
 
-mkdir -p "${SHARED}/logs" || { echo "FATAL: cannot create ${SHARED}" >&2; exit 1; }
+# logs/nccl, not logs: NCCL will not create its own directory, and if it cannot
+# open NCCL_DEBUG_FILE it falls back to stdout SILENTLY.
+mkdir -p "${SHARED}/logs/nccl" || { echo "FATAL: cannot create ${SHARED}" >&2; exit 1; }
 
-for f in fi_getinfo_shim.so gpu_cleanup.sh emit_common_env.sh emit_conn_sampler.sh \
-         workload_profile.sh bench_arm.sh; do
+# Launcher defaults, forwarded by mpiexec. NCCL writes unprefixed and collides
+# with vLLM's own prefixes, which is what mangled a KV line in the disagg arm
+# (-10-07d). %h and %p keep the ranks off one file on a filesystem with no
+# locking.
+export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
+export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,GRAPH,TUNING}
+export NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE:-${SHARED}/logs/nccl/nccl.%h.%p.log}
+
+for f in fi_getinfo_shim.so env_for_libfabric_topology_error.sh gpu_cleanup.sh \
+         emit_common_env.sh emit_conn_sampler.sh workload_profile.sh bench_arm.sh; do
     [ -f "${SCRIPT_DIR}/${f}" ] || { echo "FATAL: missing ${SCRIPT_DIR}/${f}" >&2; exit 1; }
 done
 SHIM="${SCRIPT_DIR}/fi_getinfo_shim.so"
@@ -164,8 +177,6 @@ emit_conn_sampler "${SHARED}/sample_conns.sh"
 # flag and the batching split are the complete difference from the disagg arm.
 cat > "${SHARED}/launch_role.sh" <<EOF
 #!/bin/bash
-source ${SHARED}/common_env.sh
-
 MY_HOST="\$(hostname -s)"
 MY_HOST="\${MY_HOST%%.*}"
 if [ "\${MY_HOST}" = "${NODE_HEAD_SHORT}" ]; then
@@ -191,8 +202,15 @@ else
     exit 1
 fi
 
+# Redirect BEFORE sourcing: a common_env.sh that fails to generate correctly
+# reports it here rather than into mpiexec.log.
 exec > "\${LOG}" 2>&1
+source ${SHARED}/common_env.sh
 echo "=== host=\$(hostname -s) SLINGSHOT_VNIS=\${SLINGSHOT_VNIS:-<UNSET>} ==="
+if [ -z "\${SLINGSHOT_VNIS:-}" ]; then
+    echo "SLINGSHOT_VNIS is EMPTY -- not launched under PALS. Anything reaching"
+    echo "the cxi provider fails fi_domain() with -FI_ENOSYS."
+fi
 export LD_PRELOAD=${SHIM}
 
 EXTRA=()
@@ -238,8 +256,12 @@ chmod +x "${SHARED}/launch_role.sh"
 cat "${SHARED}/run_config.txt"
 
 SAMPLE_STOP_MARKER="${SHARED}/sample_stop_${STAMP}"
+GPU_WATCH_STOP_MARKER="${SHARED}/gpu_watch_stop_${STAMP}"
 cleanup() {
-    touch "${SAMPLE_STOP_MARKER}" 2>/dev/null
+    # The GPU marker is also touched at healthy. This one only covers an abort
+    # before that point, which would otherwise leave two 1 Hz loops writing to
+    # /vast forever.
+    touch "${SAMPLE_STOP_MARKER}" "${GPU_WATCH_STOP_MARKER}" 2>/dev/null
     for n in "${NODE_HEAD}" "${NODE_TAIL}"; do
         ssh -n "$n" "pkill -TERM -f \"${PAT_VLLM}\"" 2>/dev/null
     done
@@ -270,6 +292,32 @@ CPU_BIND_ARGS=()
 # can lose the race and silently follow nothing. mpiexec.log is the only stream
 # that carries PALS-level failures.
 touch "${SHARED}/logs/head.log" "${SHARED}/logs/headless.log" "${SHARED}/logs/mpiexec.log"
+
+# --- GPU watcher: a 1 Hz memory trace per engine node, launch to healthy. It
+# must not reach the ladder -- 1 Hz on a serving node adds jitter against a
+# ~42 ms clean step (-10-07c). The remote loop exits on its own when it sees the
+# marker, so there is no pid to kill.
+if [ "${GPU_WATCH}" = "1" ]; then
+    cat > "${SHARED}/gpu_watch.sh" <<EOF
+#!/bin/bash
+# Two line types, tagged in column 1: 'dev' is per device, 'app' is per holding
+# process. Device memory that no 'app' line accounts for is held by a process
+# this node cannot enumerate -- on 165759 that gap was ~27 GiB while the node's
+# own worker was attributed correctly in the same second.
+while [ ! -f "${GPU_WATCH_STOP_MARKER}" ]; do
+    nvidia-smi --query-gpu=timestamp,index,memory.used,memory.total \\
+        --format=csv,noheader,nounits | sed 's/^/dev, /'
+    nvidia-smi --query-compute-apps=timestamp,pid,used_gpu_memory \\
+        --format=csv,noheader,nounits | sed 's/^/app, /'
+    sleep ${GPU_WATCH_INTERVAL_S}
+done
+EOF
+    for n in "${NODE_HEAD}" "${NODE_TAIL}"; do
+        ssh -n "$n" "setsid nohup bash ${SHARED}/gpu_watch.sh \
+            > ${SHARED}/logs/gpu_${n%%.*}.log 2>&1 < /dev/null &"
+    done
+fi
+
 mpiexec -n "${DP}" -ppn 1 --hosts "${NODE_HEAD},${NODE_TAIL}" \
     ${CPU_BIND_ARGS[@]+"${CPU_BIND_ARGS[@]}"} \
     bash "${SHARED}/launch_role.sh" > "${SHARED}/logs/mpiexec.log" 2>&1 &
@@ -285,12 +333,13 @@ tail -n +1 -f "${SHARED}/logs/mpiexec.log"  > >(sed -u 's/^/[MPI]  /') & TAIL_M_
 # reliable detector, so the log is. Remedy all three times was to give that node
 # the client role -- hence the DIRTY_NODE line and exit 10.
 #
-# These two strings only. 'init_device' appears 12-16 times in a HEALTHY log, so
-# matching it would rotate a good node on any slow startup. Under-detecting is
-# the safe direction: an unmatched failure exits 1 and a human reads the log.
+# This string alone, no alternation. It exists only in the raising path,
+# v1/worker/utils.py:418-427. 'Free memory on device cuda' matches the same runs
+# but would also match every healthy run if a vLLM bump ever added the device id
+# to the healthy INFO line (-10-07d).
 dirty_signature() {
-    grep -lE 'No available memory for the cache blocks|Free memory on device cuda' \
-        "${SHARED}/logs/head.log" "${SHARED}/logs/headless.log" 2>/dev/null
+    grep -lF 'is less than desired GPU memory utilization' \
+        "${SHARED}"/logs/head*.log 2>/dev/null
 }
 
 t0=$(date +%s)
@@ -313,6 +362,16 @@ for i in $(seq 1 "${HEALTH_TRIES}"); do
         "$(tail -n 1 "${SHARED}/logs/head.log" 2>/dev/null | cut -c1-100)"
     sleep 5
 done
+# Here, not in cleanup: on a boot failure cleanup runs too, but on a healthy
+# boot the trap would not fire until after the ladder. The marker is only the
+# backstop -- it took ~50 s to propagate on /vast (2026-10-08) and the jitter
+# rule needs the watchers gone now.
+touch "${GPU_WATCH_STOP_MARKER}" 2>/dev/null
+if [ "${GPU_WATCH}" = "1" ]; then
+    for n in "${NODE_HEAD}" "${NODE_TAIL}"; do
+        ssh -n "$n" "pkill -f ${SHARED}/gpu_watch.sh" 2>/dev/null
+    done
+fi
 kill -TERM "${TAIL_H_PID}" "${TAIL_T_PID}" "${TAIL_M_PID}" 2>/dev/null
 if [ "${healthy}" -ne 1 ]; then
     _sig=$(dirty_signature)
@@ -354,6 +413,18 @@ source "${SHARED}/common_env.sh"
 if grep -qiE 'NixlConnector|kv_transfer_config|KVConnector' "${SHARED}/logs/head.log"; then
     echo "WARNING: the head log mentions a KV connector. This arm must have none." >&2
 fi
+
+# Non-empty is the only proof the redirect took. NOT a count: %p is per process
+# and every process that touches NCCL gets a file.
+if [ -z "$(find "${SHARED}/logs/nccl" -name 'nccl.*.log' -size +0c -print -quit 2>/dev/null)" ]; then
+    echo "WARNING: no non-empty file under logs/nccl -- NCCL_DEBUG_FILE did not" >&2
+    echo "         take and NCCL went to stdout, back into the role logs." >&2
+fi
+
+echo ""
+echo "=== KV cache groups ==="
+grep -hiE 'kv_cache_group|KVCacheGroupSpec|SlidingWindowSpec|FullAttentionSpec|num_kv_cache_groups' \
+    "${SHARED}/logs/head.log" 2>/dev/null | head -12 | sed 's/^/  /'
 
 # --- Samplers. The connection split is decided in the first seconds of a bench
 # and cannot be recovered afterwards.
