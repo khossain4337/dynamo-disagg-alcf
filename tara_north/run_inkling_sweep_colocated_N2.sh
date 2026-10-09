@@ -63,7 +63,8 @@ GPU_WATCH=${GPU_WATCH:-1}
 GPU_WATCH_INTERVAL_S=${GPU_WATCH_INTERVAL_S:-1}
 RUNS_ROOT=${RUNS_ROOT:-/vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS}
 STAMP=$(date +%Y%m%d_%H%M%S)
-SHARED=${SHARED:-${RUNS_ROOT}/inkling_colocated_dp${DP}tp${TP}_isl${ISL}_osl${OSL}_mml${MAX_MODEL_LEN}_${STAMP}}
+RUN_TAG=${RUN_TAG:-}
+SHARED=${SHARED:-${RUNS_ROOT}/inkling_colocated_dp${DP}tp${TP}_isl${ISL}_osl${OSL}_mml${MAX_MODEL_LEN}${RUN_TAG:+_${RUN_TAG}}_${STAMP}}
 
 # --- Model: resolved from the cache, because that also proves it is there -----
 HF_CACHE_ROOT=${HF_CACHE_ROOT:-/vast/draco/tara/projects/Tara_Deployment/software/model-weights/hub}
