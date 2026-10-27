@@ -78,7 +78,6 @@ cd ${AWS_NCCL_OFI_CLONE_DIR}/aws-ofi-nccl
 pip install conda-pack ipython uv
 uv pip install "vllm==0.32.1rc1.dev562+g9e3db4887" \
     nixl==1.5.1 \
-    aiperf==0.13.0 \
     aisimulate==0.13.0 \
     py-spy==0.4.2 \
     nvitop==1.7.2 \
