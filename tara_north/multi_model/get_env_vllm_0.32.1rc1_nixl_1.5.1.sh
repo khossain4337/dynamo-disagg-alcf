@@ -22,7 +22,10 @@ OFI_PLUGIN_DIR=${AWS_NCCL_OFI_CLONE_DIR}/v1.22.0_lf2.3.1_cu13.0
 #
 export CUDA_HOME LIBFABRIC_DIR OFI_PLUGIN_DIR
 #
+# conda and module scripts read unset variables
+set +u
 source $MINIFORGE3_ROOT/bin/activate
+set -u
 
 ## CHANGE HERE!!!
 TMP_WORK=${TMPDIR_FOR_ENVS}
@@ -54,11 +57,13 @@ conda create python=3.12.12 --prefix ${ENVPREFIX} --override-channels \
            --strict-channel-priority \
            --yes
 
+set +u
 conda activate ${ENVPREFIX}
 echo "Conda is coming from $(which conda)"
 
 
 module add gcc-native
+set -u
 export CXX=$(which g++)
 export CC=$(which gcc)
 
