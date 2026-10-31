@@ -81,6 +81,10 @@ python -c "import vllm, torch; print(vllm.__version__, torch.__version__, torch.
 pip list | grep -i nixl
 python -c "import nixl._api; print(nixl._api.__file__)"
 SP=$(python -c 'import site; print(site.getsitepackages()[0])')
+# libfabric dlopens "libcudart.so"; without it GPU buffers register as host memory.
+mkdir -p $ENVPREFIX/lib/cudart_for_libfabric
+ln -sf $SP/nvidia/cu13/lib/libcudart.so.13 $ENVPREFIX/lib/cudart_for_libfabric/libcudart.so
+ls -l $ENVPREFIX/lib/cudart_for_libfabric
 # libcudart => not found is expected; a FABRIC_1.x version error is not.
 ldd $SP/.nixl_cu13.mesonpy.libs/plugins/libplugin_LIBFABRIC.so 2>&1 | grep -E 'fabric|hwloc|not found'
 
