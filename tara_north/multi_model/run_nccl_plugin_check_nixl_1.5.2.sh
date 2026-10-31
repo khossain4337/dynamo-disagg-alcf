@@ -5,7 +5,7 @@ source "$HERE/env_vllm_0.32.1rc1_nixl_1.5.2.sh"
 SP=$(python -c 'import site; print(site.getsitepackages()[0])')
 B=$SOFT_ROOT/repositories/nccl-tests/build_cu13.0_nccl2.30.7
 OFI=$SOFT_ROOT/repositories/aws_nccl_ofi_v1.22.0/v1.22.0_lf2.3.1_cu13.0
-export LD_LIBRARY_PATH=$SP/nvidia/nccl/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$SP/nvidia/nccl/lib:$SP/nvidia/cu13/lib:$LD_LIBRARY_PATH
 export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,ENV,NET
 export FI_MR_CACHE_MONITOR=userfaultfd FI_CXI_DISABLE_HOST_REGISTER=1 FI_CXI_DEFAULT_CQ_SIZE=131072 \
   FI_CXI_RDZV_PROTO=alt_read FI_CXI_RDZV_EAGER_SIZE=0 FI_CXI_RDZV_THRESHOLD=0 FI_CXI_RDZV_GET_MIN=0 \
