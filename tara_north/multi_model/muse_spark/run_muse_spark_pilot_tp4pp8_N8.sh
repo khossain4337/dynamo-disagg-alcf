@@ -94,7 +94,7 @@ exec vllm serve ${MODEL} "\${ROLE[@]}" \\
     --distributed-executor-backend mp \\
     --tensor-parallel-size ${TP} --pipeline-parallel-size ${PP} --enable-expert-parallel \\
     --max-model-len ${MAX_MODEL_LEN} \\
-    --gpu-memory-utilization 0.90 --dtype bfloat16 --kv-cache-dtype auto --moe-backend triton \\
+    --gpu-memory-utilization 0.85 --dtype bfloat16 --kv-cache-dtype auto --moe-backend triton \\
     --no-disable-hybrid-kv-cache-manager --no-enable-prefix-caching \\
     --max-num-batched-tokens 16384 --max-num-seqs 256 --long-prefill-token-threshold 8192 \\
     --language-model-only \\
@@ -235,6 +235,9 @@ for c in ${CONCURRENCIES}; do
     RUN_DIR="${SHARED}" OUT_DIR="${_out}" \
         bash "${TN}/bench_arm.sh"
     _rc=$?
+    # vllm bench exits 0 even when requests fail.
+    [ "${_rc}" -eq 0 ] && ! python -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(r["failed"] > 0 or r["completed"] != int(sys.argv[2]))' \
+        "${_out}/result.json" "$(( PROMPTS_PER_STREAM * c ))" && _rc=20
     if [ "${_rc}" -eq 0 ]; then _st=ok; else _st=failed; fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${ISL}" "${OSL}" "${c}" "${_st}" "${_rc}" "${_out}" >> "${STATUS_TSV}"
     if ! curl --noproxy '*' -s -o /dev/null -w '%{http_code}' "http://${HEAD_IP}:${PORT}/health" 2>/dev/null | grep -q 200; then
