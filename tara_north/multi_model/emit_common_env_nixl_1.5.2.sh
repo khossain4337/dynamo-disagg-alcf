@@ -12,6 +12,8 @@ set +u
 type module >/dev/null 2>&1 || source /etc/profile >/dev/null 2>&1
 source $HERE/env_vllm_0.32.1rc1_nixl_1.5.2.sh
 set -u
+# HPC SDK keeps curand headers out of CUDA_HOME; FlashInfer's sampling JIT needs them.
+export CPATH=/opt/nvidia/hpc_sdk/Linux_aarch64/25.9/math_libs/13.0/targets/sbsa-linux/include\${CPATH:+:\$CPATH}
 export PYTHONNOUSERSITE=1
 export HF_HOME=$SOFT_ROOT/model-weights HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
