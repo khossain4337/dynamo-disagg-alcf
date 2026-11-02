@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -l select=10 -l place=scatter:excl:group=tier1
+#PBS -l select=10 -l place=scatter:excl
 #PBS -l walltime=04:00:00
 #PBS -A inference_service
 #PBS -q workq
