@@ -19,9 +19,11 @@ python3 - "$MODEL" "$HF_HOME" <<'PY'
 import json, os, sys
 root = os.path.join(sys.argv[2], "hub", "models--" + sys.argv[1].replace("/", "--"))
 rev = os.path.join(root, "snapshots", open(os.path.join(root, "refs", "main")).read().strip())
-want = sorted(set(json.load(open(os.path.join(rev, "model.safetensors.index.json")))["weight_map"].values()))
-missing = [w for w in want if not os.path.exists(os.path.join(rev, w))]
+idx = os.path.join(rev, "model.safetensors.index.json")
 partial = [b for b in os.listdir(os.path.join(root, "blobs")) if b.endswith(".incomplete")]
+if not os.path.exists(idx): sys.exit(f"no index yet, {len(partial)} .incomplete")
+want = sorted(set(json.load(open(idx))["weight_map"].values()))
+missing = [w for w in want if not os.path.exists(os.path.join(rev, w))]
 gb = sum(os.path.getsize(os.path.join(rev, w)) for w in want if w not in missing) / 2**30
 print(f"{rev}\nshards {len(want) - len(missing)}/{len(want)}, {gb:.1f} GiB, {len(partial)} .incomplete")
 if missing or partial: sys.exit(1)
@@ -35,5 +37,8 @@ AVAIL=$(df -BG --output=avail "$HF_HOME" | tail -1 | tr -dc '0-9')
 LOG=$HF_HOME/download_$(basename "$MODEL")_$(date +%Y%m%d_%H%M%S).log
 # setsid: survives the ssh session.
 setsid nohup hf download "$MODEL" --max-workers 8 > "$LOG" 2>&1 < /dev/null &
-echo "pid $! log $LOG"
+PID=$!
+echo "pid $PID log $LOG"
 echo "verify: VERIFY=1 MODEL=$MODEL bash ${BASH_SOURCE[0]}"
+# Ctrl-C stops the tail only; the download keeps going.
+tail -f --pid=$PID "$LOG"
