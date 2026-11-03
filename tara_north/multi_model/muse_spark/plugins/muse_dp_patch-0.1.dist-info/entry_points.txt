@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+muse_dp_patch = muse_dp_patch:register
