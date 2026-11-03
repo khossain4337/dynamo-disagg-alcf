@@ -8,13 +8,14 @@
 #PBS -o /vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS/outdir_tara
 #PBS -e /vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS/errordir_tara
 #PBS -j oe
-# Muse-Spark DEP8 boot: TP4 x DP8 x EP32, (1024,256), c=1 and c=32. 8 serving + client + 1 spare.
+# Muse-Spark DEP8 boot: TP4 x DP8 x EP32, mnbt 2048, (1024,256), c=1 and c=32. 8 serving + client + 1 spare.
 TARA_NORTH=/vast/draco/tara/projects/Tara_Deployment/software/dynamo-disagg-alcf/tara_north
 MUSE_SPARK=${TARA_NORTH}/multi_model/muse_spark
 RUNS=/vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS
 ISL=1024
 OSL=256
 CONCURRENCIES="1 32"
+MNBT=2048
 MAX_ATTEMPTS=3
 
 # PBS_NODEFILE is local to the mother superior; staged so any node can launch.
@@ -28,7 +29,8 @@ TODO=${CONCURRENCIES}
 for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
     LOG=${RUNS}/qsub_${PBS_JOBID}_muse_spark_dep8_isl${ISL}_osl${OSL}_a${attempt}.log
     echo "=== attempt ${attempt}/${MAX_ATTEMPTS} client=${CLIENT} parked=${PARKED:-none} concurrencies=${TODO} ==="
-    cmd="export PBS_NODEFILE=${JOB_NODEFILE} ISL=${ISL} OSL=${OSL} CONCURRENCIES='${TODO}' EXCLUDE_NODES='${PARKED}'; \
+    cmd="export PBS_NODEFILE=${JOB_NODEFILE} ISL=${ISL} OSL=${OSL} CONCURRENCIES='${TODO}' EXCLUDE_NODES='${PARKED}' \
+        MAX_NUM_BATCHED_TOKENS=${MNBT} RUN_TAG=mnbt${MNBT}; \
         bash ${MUSE_SPARK}/run_muse_spark_pilot_tp4dp8_N8.sh"
     if [ "${CLIENT}" = "$(hostname -s)" ]; then bash -c "${cmd}"; else ssh -n "${CLIENT}" "${cmd}"; fi 2>&1 | tee "${LOG}"
     RC=${PIPESTATUS[0]}

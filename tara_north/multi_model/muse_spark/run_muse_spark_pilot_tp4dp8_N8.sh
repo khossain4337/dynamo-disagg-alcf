@@ -14,6 +14,8 @@ PROMPTS_PER_STREAM=4
 MODEL=meta-models/Muse-Spark-Open-816B-A42B
 NNODES=8 TP=4 DP=8
 MAX_MODEL_LEN=1048576
+# AG/RS gathers DP x this many tokens into each MoE layer (16384 OOM'd, -11-03b).
+MNBT=${MAX_NUM_BATCHED_TOKENS:-16384}
 API_SERVER_COUNT=4
 PORT=8100
 DP_RPC_PORT=29550
@@ -101,7 +103,7 @@ exec vllm serve ${MODEL} "\${ROLE[@]}" \\
     --max-model-len ${MAX_MODEL_LEN} \\
     --gpu-memory-utilization 0.85 --dtype bfloat16 --kv-cache-dtype auto --moe-backend triton \\
     --no-disable-hybrid-kv-cache-manager --no-enable-prefix-caching \\
-    --max-num-batched-tokens 16384 --max-num-seqs 256 --long-prefill-token-threshold 8192 \\
+    --max-num-batched-tokens ${MNBT} --max-num-seqs 256 --long-prefill-token-threshold $(( MNBT < 8192 ? MNBT : 8192 )) \\
     --language-model-only \\
     --numa-bind --numa-bind-nodes 0 1 2 3 --numa-bind-cpus 4-71 76-143 148-215 220-287 \\
     --distributed-timeout-seconds 3600 --cpu-distributed-timeout-seconds 3600 \\
@@ -117,7 +119,7 @@ chmod +x "${SHARED}/launch_role.sh"
     echo "head             ${SHORT[0]} ${HEAD_IP} port ${PORT}  api-servers ${API_SERVER_COUNT}"
     echo "dp ranks         ${SHORT[*]}"
     echo "excluded         ${EXCLUDE_NODES:-none}"
-    echo "parallelism      TP ${TP} x DP ${DP}, EP $(( TP * DP )), ag_rs"
+    echo "parallelism      TP ${TP} x DP ${DP}, EP $(( TP * DP )), ag_rs, mnbt ${MNBT}"
     echo "plugin           ${PLUGINS}"
     echo "git              $(git -C "${TN}" rev-parse --short HEAD 2>/dev/null || echo '(none)')"
 } > "${SHARED}/run_config.txt"
