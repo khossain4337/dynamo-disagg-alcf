@@ -10,7 +10,8 @@ TN="$(cd "${HERE}/../.." && pwd)"
 PARITY_CONCURRENCIES=${PARITY_CONCURRENCIES:-1 32}
 EP=${EP:-1}
 EXCLUDE_NODES=${EXCLUDE_NODES:-}
-PROXY_SCRIPT=${PROXY_SCRIPT:?set PROXY_SCRIPT to toy_proxy_server.py from the 9e3db48873 tree}
+# Verbatim copy of tests/v1/kv_connector/nixl_integration/toy_proxy_server.py at the pin.
+PROXY_SCRIPT=${PROXY_SCRIPT:-${HERE}/toy_proxy_server_9e3db48873.py}
 MODEL=meta-models/Muse-Spark-Open-816B-A42B
 NNODES=8 TP=4 PP=8
 MAX_MODEL_LEN=1048576

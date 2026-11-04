@@ -13,7 +13,6 @@ TARA_NORTH=/vast/draco/tara/projects/Tara_Deployment/software/dynamo-disagg-alcf
 MUSE_SPARK=${TARA_NORTH}/multi_model/muse_spark
 RUNS=/vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS
 EP=${EP:-1}
-PROXY_SCRIPT=${PROXY_SCRIPT:?qsub -v PROXY_SCRIPT=<toy_proxy_server.py from the 9e3db48873 tree>}
 MAX_ATTEMPTS=3
 
 # PBS_NODEFILE is local to the mother superior; staged so any node can launch.
@@ -26,7 +25,7 @@ PARKED=
 for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
     LOG=${RUNS}/qsub_${PBS_JOBID}_muse_spark_parity_pd_ep${EP}_a${attempt}.log
     echo "=== attempt ${attempt}/${MAX_ATTEMPTS} client=${CLIENT} parked=${PARKED:-none} ==="
-    cmd="export PBS_NODEFILE=${JOB_NODEFILE} EP=${EP} PROXY_SCRIPT=${PROXY_SCRIPT} EXCLUDE_NODES='${PARKED}'; \
+    cmd="export PBS_NODEFILE=${JOB_NODEFILE} EP=${EP} EXCLUDE_NODES='${PARKED}'; \
         bash ${MUSE_SPARK}/run_muse_spark_parity_pd_tp4pp8_N16.sh"
     if [ "${CLIENT}" = "$(hostname -s)" ]; then bash -c "${cmd}"; else ssh -n "${CLIENT}" "${cmd}"; fi 2>&1 | tee "${LOG}"
     RC=${PIPESTATUS[0]}
