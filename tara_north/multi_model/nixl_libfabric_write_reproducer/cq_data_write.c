@@ -1,7 +1,8 @@
 // RMA write with remote CQ data over cxi: fi_writemsg(FI_REMOTE_CQ_DATA) as NIXL issues it, then
 // fi_writedata. One process writes to its own endpoint. Exit code = number of failed cases.
 // Build: LF=/opt/cray/libfabric/2.3.1; gcc -O2 -o cq_data_write cq_data_write.c -I$LF/include -L$LF/lib64 -lfabric
-// Run inside a PBS job (cxi needs the job VNI): mpiexec -n 1 ./cq_data_write
+// Run inside a PBS job (cxi needs a VNI; PALS gives a 1-node launch none without the flag):
+//   mpiexec -n 1 --single-node-vni ./cq_data_write
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
