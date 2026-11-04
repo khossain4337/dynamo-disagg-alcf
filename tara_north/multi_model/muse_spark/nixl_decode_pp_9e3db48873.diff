@@ -1,0 +1,93 @@
+diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -72,6 +72,7 @@
+ )
+ from vllm.distributed.parallel_state import (
+     get_pcp_group,
++    get_pp_group,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+ )
+@@ -867,6 +868,7 @@
+         # PP>1 (push mode): this worker holds a contiguous layer slice and
+         # transfers into the matching sub-range of a PP=1 remote's regions.
+         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
++        self.pp_rank = get_pp_group().rank_in_group
+         self._remote_region_offset = 0
+         if self.pp_size > 1:
+             if self._is_hma_required and not self._supports_pp_hma:
+@@ -882,8 +884,11 @@
+                     "NixlPushConnector does not support pipeline_parallel_size > 1 "
+                     "with Mamba/SSM hybrid KV cache layouts yet."
+                 )
+-            # Decode-side PP is unsupported (completions counted per consumer rank).
+-            if vllm_config.kv_transfer_config.kv_role == "kv_consumer":
++            # disaggpp: push allows decode-side PP when producer PP matches.
++            if (
++                vllm_config.kv_transfer_config.kv_role == "kv_consumer"
++                and self._TRANSFER_MODE != "push"
++            ):
+                 raise NotImplementedError(
+                     "NixlPushConnector consumer (decode) does not support "
+                     "pipeline_parallel_size > 1."
+@@ -1142,9 +1147,23 @@
+         best_rtt = float("inf")
+         best_offset: float | None = None
+ 
++        # disaggpp: decode PP > 1 needs equal prefill PP; stage s pairs with stage s.
++        remote_pp_ranks: list[int] | range = range(remote_pp_size)
++        if self.kv_transfer_config.kv_role == "kv_consumer":
++            p_pp, d_pp = remote_pp_size, self.pp_size
++        else:
++            p_pp, d_pp = self.pp_size, remote_pp_size
++        if d_pp > 1:
++            if p_pp != d_pp:
++                raise NotImplementedError(
++                    "NIXL P/D with decode PP > 1 needs equal PP sizes; "
++                    f"prefill {p_pp}, decode {d_pp}."
++                )
++            remote_pp_ranks = [self.pp_rank]
++
+         with zmq_ctx(zmq.REQ, path) as sock:
+             for remote_pp_rank, remote_rank in itertools.product(
+-                range(remote_pp_size), p_remote_ranks
++                remote_pp_ranks, p_remote_ranks
+             ):
+                 logger.debug(
+                     "Querying metadata on path: %s at remote pp rank %s, tp rank %s",
+diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py
+@@ -180,6 +180,9 @@
+             "decode_host": self.side_channel_host,
+             "decode_port": self.side_channel_port,
+             "decode_tp_size": (self.vllm_config.parallel_config.tensor_parallel_size),
++            "decode_pp_size": (
++                self.vllm_config.parallel_config.pipeline_parallel_size
++            ),
+             "local_block_ids": local_block_ids,
+             "remote_engine_id": params["remote_engine_id"],
+             "remote_host": params["remote_host"],
+diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+@@ -479,6 +479,7 @@
+             registration_data["decode_host"],
+             registration_data["decode_port"],
+             registration_data["decode_tp_size"],
++            pp_size=registration_data.get("decode_pp_size", 1),
+         )
+         if fut is not None:
+ 
+@@ -795,7 +796,9 @@
+             # here: pp_size stages * producers-per-consumer (>1 when
+             # producer TP > consumer TP; tp_size is the producer TP).
+             producers_per_consumer = max(1, int(tp_size) // self.world_size)
+-            expected_notifs = meta.pp_size * producers_per_consumer
++            # disaggpp: with decode PP, each D stage hears only its own P stage.
++            pp_producers = max(1, meta.pp_size // self.pp_size)
++            expected_notifs = pp_producers * producers_per_consumer
+             self.consumer_notification_counts_by_req[req_id] += 1
+             if self.consumer_notification_counts_by_req[req_id] < expected_notifs:
+                 continue
