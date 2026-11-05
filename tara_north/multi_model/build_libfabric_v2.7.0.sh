@@ -2,6 +2,9 @@
 # Upstream libfabric v2.7.0 (cxi + CUDA) with its json-c and curl deps.
 # Compute node inside a PBS job (cxi devel headers exist only there), no args.
 source ~/proxies.sh
+module load gcc-native
+# The nvhpc module exports CC=nvc; cmake and configure both honour it.
+export CC=$(which gcc) CXX=$(which g++)
 set -e
 R=/vast/draco/tara/projects/Tara_Deployment/software/repositories/libfabric_v2.7.0
 DEPS=$R/deps
