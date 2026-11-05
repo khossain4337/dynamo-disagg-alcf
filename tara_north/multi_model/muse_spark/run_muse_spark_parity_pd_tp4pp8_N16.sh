@@ -252,19 +252,34 @@ wait_up "${PROXY_IP}:${PROXY_PORT}" /healthcheck proxy || { tail -n 30 "${SHARED
     echo "scheduler lines (want no 'disabled' / 'does not yet support'):"
     grep -hoE 'Async scheduling is disabled.*|Model Runner V2 does not yet support.*|Hidden layers were unevenly partitioned.*' \
         "${SHARED}/logs/p0.log" "${SHARED}/logs/d0.log" | sort -u | sed 's/^/  /'
-    # Counts only: the NIXL 1.5.2 strings are not calibrated yet. Read them on the first boot.
-    echo "nixl per node: push-connector / cuda-runtime / libfabric-backend / registered-memory lines"
-    for f in "${SHARED}"/logs/[pd][0-9].log; do
-        printf '  %-4s %4s %4s %4s %4s\n' "$(basename "${f}" .log)" \
-            "$(grep -c NixlPushConnector "${f}")" "$(grep -c 'System runtime: CUDA' "${f}")" \
-            "$(grep -c 'Initializing Libfabric Backend' "${f}")" "$(grep -c 'Registered memory on' "${f}")"
-    done
     echo "coherence through the proxy:"
     curl --noproxy '*' -s "http://${PROXY_IP}:${PROXY_PORT}/v1/completions" -H 'Content-Type: application/json' \
         -d "{\"model\":\"${MODEL}\",\"prompt\":\"The capital of France is\",\"max_tokens\":32,\"temperature\":0}" \
         > "${SHARED}/coherence.json"
     python -c 'import json,sys; print("  " + repr(json.load(open(sys.argv[1]))["choices"][0]["text"]))' \
         "${SHARED}/coherence.json" 2>/dev/null || sed 's/^/  /' "${SHARED}/coherence.json"
+    # Per-node counts from DECISIONS -11-04b; head adds the scheduler. After the first request.
+    echo "nixl gate (mismatches as got/want):"
+    ok=1
+    for f in "${SHARED}"/logs/[pd][0-9].log; do
+        b=$(basename "${f}" .log)
+        while IFS='|' read -r wh wo s; do
+            w=${wo}; [ "${b:1}" = 0 ] && w=${wh}
+            n=$(grep -cF -- "${s}" "${f}")
+            [ "${n}" = "${w}" ] || { echo "  ${b}  ${n}/${w}  ${s}"; ok=0; }
+        done <<'T'
+5|4|Creating v1 connector with name: NixlPushConnector
+1|0|Initializing NIXL Scheduler
+4|4|Created 4 rails using provider=cxi
+16|16|Using provider with FI_HMEM support
+4|4|Registered memory on 1 rails, mem_type=1 device=1
+4|4|NIXL compatibility check passed
+0|0|drainPostQueue: post failed
+0|0|NIXL_ERR_BACKEND
+0|0|ret=-22
+T
+    done
+    [ "${ok}" = 1 ] && echo "  all 16 nodes match"
 } 2>&1 | tee "${SHARED}/gates.txt"
 
 # --- Parity: each concurrency twice, through the proxy.
