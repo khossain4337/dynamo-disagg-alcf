@@ -272,7 +272,7 @@ wait_up "${PROXY_IP}:${PROXY_PORT}" /healthcheck proxy || { tail -n 30 "${SHARED
 1|0|Initializing NIXL Scheduler
 4|4|Created 4 rails using provider=cxi
 16|16|Using provider with FI_HMEM support
-4|4|Registered memory on 1 rails, mem_type=1 device=1
+4|4|Registered memory on 1 rails, mem_type=1
 4|4|NIXL compatibility check passed
 0|0|drainPostQueue: post failed
 0|0|NIXL_ERR_BACKEND
@@ -284,6 +284,10 @@ T
 
 # --- Parity: each concurrency twice, through the proxy.
 mkdir -p "${SHARED}/parity"
+# api_server_count > 1 disables vLLM's stats log; D's KV source comes from /metrics.
+m() { curl --noproxy '*' -s "http://${D_IP}:${D_PORT}/metrics" \
+    | grep -E '^vllm:(prompt_tokens_by_source|external_prefix_cache)' > "${SHARED}/parity/metrics_d_$1.txt"; }
+m start
 RC=0
 for c in ${PARITY_CONCURRENCIES}; do
     for p in 1 2; do
@@ -292,6 +296,7 @@ for c in ${PARITY_CONCURRENCIES}; do
     done
     python "${HERE}/parity_compare.py" "${SHARED}/parity/c${c}_p1.jsonl" "${SHARED}/parity/c${c}_p2.jsonl" \
         | tee "${SHARED}/parity/same_c${c}.txt"
+    m "c${c}"
     if ! up "${P_IP}:${P_PORT}" /health || ! up "${D_IP}:${D_PORT}" /health; then
         echo "a role is unhealthy after c=${c}." >&2
         RC=30; break
