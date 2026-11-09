@@ -16,7 +16,7 @@ ISL=1024
 OSL=256
 CONCURRENCIES="1 2 4 8 16"
 MR_CACHE=on
-MAX_ATTEMPTS=1
+MAX_ATTEMPTS=2
 
 # PBS_NODEFILE is local to the mother superior; staged so any node can launch.
 JOB_NODEFILE=${RUNS}/${PBS_JOBID}.txt
