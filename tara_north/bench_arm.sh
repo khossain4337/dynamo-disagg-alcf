@@ -117,6 +117,8 @@ WARMUP_PROMPTS=${WARMUP_PROMPTS:-${WL_WARMUP_PROMPTS}}
 # (c) let requests actually COMPLETE and release their KV -- which is itself a
 # test the 8192 warmup never got far enough to perform.
 WARMUP_OSL=${WARMUP_OSL:-${WL_WARMUP_OSL}}
+# Word-split on purpose: a wrapper may replace it (multi_model/muse_spark/bench_serve_long_timeout.py).
+BENCH_CMD=${BENCH_CMD:-vllm bench serve}
 
 # --- Where results land -------------------------------------------------------
 # NOT the current directory. This script is run from the checkout, and results
@@ -392,7 +394,7 @@ done
 
 run_bench() {
     local label=$1 n=$2 osl=$3 outfile=$4
-    vllm bench serve \
+    ${BENCH_CMD} \
         --backend openai \
         --base-url "${BASE_URL}" \
         --endpoint /v1/completions \
