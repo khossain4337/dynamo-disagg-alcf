@@ -62,6 +62,9 @@ Muse-Spark-Open-816B-A42B, TP4 x PP8 per instance, EP off, 16 serving nodes.
 | `qsub_muse_spark_diag_mem_mnbt16k_N8.sh` | 16k–128k at batched tokens 16,384. | OOM'd at 128k: the pilots' failure, reproduced. | Done |
 | `qsub_muse_spark_diag_mem_mnbt8k_N8.sh` | 16k–128k at batched tokens 8,192. | Served 128k; set 8,192 for the sweeps. | Done |
 | `qsub_muse_spark_diag_mem_mnbt8k_1m_N8.sh` | 128k–1M at 8,192. | Memory flat to 1M; 1M time to first token ≤ 152 s. | Done |
+| `run_muse_spark_pilot_tp16pp2_N8.sh` | One TP16 x PP2 instance, one wave per cell (num_prompts = c). | Tests whether 16 GPUs per stage decode faster than TP4 x PP8 despite cross-node all-reduces. | Pilot |
+| `qsub_muse_spark_pilot_tp16pp2_short_N8.sh` | (1024, 256) at c 1, 4, 16. | Clean decode speed at batch c; read first. | Pilot |
+| `qsub_muse_spark_pilot_tp16pp2_long_N8.sh` | Warmup shape (128k, 128) c=16, then 128k / 512k / 1M with 1,024 out at c=4. | Peak memory and long-context decode; run after the short one reads. | Pilot |
 
 ## `muse_spark/` — correctness
 
