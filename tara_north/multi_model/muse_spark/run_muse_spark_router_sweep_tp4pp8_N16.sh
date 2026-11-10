@@ -120,7 +120,7 @@ exec vllm serve ${MODEL} "\${SERVE[@]}" \\
     --max-model-len ${MAX_MODEL_LEN} \\
     --gpu-memory-utilization 0.85 --dtype bfloat16 --kv-cache-dtype auto --moe-backend triton \\
     --no-disable-hybrid-kv-cache-manager --no-enable-prefix-caching \\
-    --max-num-batched-tokens 16384 --max-num-seqs 256 --long-prefill-token-threshold 8192 \\
+    --max-num-batched-tokens 8192 --max-num-seqs 256 --long-prefill-token-threshold 8192 \\
     --language-model-only \\
     --numa-bind --numa-bind-nodes 0 1 2 3 --numa-bind-cpus 4-71 76-143 148-215 220-287 \\
     --distributed-timeout-seconds 3600 --cpu-distributed-timeout-seconds 3600 \\
@@ -157,6 +157,8 @@ cat "${SHARED}/run_config.txt"
 GPU_WATCH_STOP="${SHARED}/gpu_watch_stop"
 cleanup() {
     touch "${GPU_WATCH_STOP}" 2>/dev/null
+    [ -n "${WATCH_PID:-}" ] && kill -TERM -- "-${WATCH_PID}" 2>/dev/null
+    [ -f "${SHARED}/bench.pid" ] && kill -TERM -- "-$(cat "${SHARED}/bench.pid")" 2>/dev/null
     kill -TERM ${MPIEXEC_PID:-} ${TAIL_A_PID:-} ${TAIL_B_PID:-} ${TAIL_M_PID:-} ${ROUTER_SSH_PID:-} 2>/dev/null
     ssh -n "${NODES[RT]}" "pkill -f '[v]llm-router'; fuser -k ${ROUTER_PORT}/tcp ${ROUTER_METRICS_PORT}/tcp" 2>/dev/null
     for i in "${!ENGINE[@]}"; do
@@ -272,7 +274,12 @@ bench() {
     BASE_URL="${ROUTER_URL}" METRICS_URLS="${METRICS_URLS}" \
     CXI_NODES="$(IFS=,; echo "${ENGINE[*]}")" WORKLOAD=iter32k WARMUP_PROMPTS=0 BENCH_CMD="${BENCH_CMD}" \
     ISL="$1" OSL="$2" NUM_PROMPTS="$3" MAX_CONCURRENCY="$4" RUN_DIR="${SHARED}" OUT_DIR="$5" \
-        bash "${TN}/bench_arm.sh"
+        setsid bash "${TN}/bench_arm.sh" &
+    # Own process group, so hang_watch.sh can kill the client.
+    echo $! > "${SHARED}/bench.pid"
+    wait $!; local rc=$?
+    rm -f "${SHARED}/bench.pid"
+    return "${rc}"
 }
 alive() { up "${A_IP}:${A_PORT}" /health && up "${B_IP}:${B_PORT}" /health && two_workers; }
 # Per instance, in METRICS_URLS order. Tag built exactly as bench_arm builds it (trailing _ included).
@@ -290,8 +297,12 @@ preemptions() {
 rm_scrape start
 echo ""
 echo "=== warmup isl=131072 osl=128 n=16 c=16 (once per boot, discarded) ==="
+DEAD="${SHARED}/dead_stage.txt"
+setsid bash "${HERE}/hang_watch.sh" "${SHARED}" "${METRICS_URLS}" "${SHARED}"/logs/[ab][0-9].log "${SHARED}/logs/mpiexec.log" \
+    > "${SHARED}/logs/hang_watch.log" 2>&1 &
+WATCH_PID=$!
 bench 131072 128 16 16 "${SHARED}/bench/$(date +%Y%m%d_%H%M%S)_warmup" \
-    || { alive || exit 30; echo "warmup failed." >&2; exit 1; }
+    || { [ ! -f "${DEAD}" ] && alive || exit 30; echo "warmup failed." >&2; exit 1; }
 
 STATUS_TSV="${SHARED}/bench_status.tsv"
 printf 'isl\tosl\tconcurrency\tstatus\texit_code\tbench_dir\tpreemptions\n' > "${STATUS_TSV}"
@@ -310,6 +321,7 @@ for cell in ${CELLS}; do
     if [ "${_rc}" -eq 0 ]; then _st=ok; else _st=failed; fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${isl}" "${osl}" "${c}" "${_st}" "${_rc}" "${_out}" "$(preemptions "${_out}")" >> "${STATUS_TSV}"
     rm_scrape "isl${isl}_osl${osl}_c${c}"
+    [ -f "${DEAD}" ] && { echo "hang watch fired in ${cell}: $(cat "${DEAD}")" >&2; RC=30; break; }
     alive || { echo "an instance is unhealthy after ${cell}; the cells after it did not run." >&2; RC=30; break; }
 done
 exit "${RC}"
