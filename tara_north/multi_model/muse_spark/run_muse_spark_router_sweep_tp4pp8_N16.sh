@@ -174,7 +174,8 @@ trap 'exit 130' INT TERM
 for k in $(seq 0 $((NNODES - 1))); do touch "${SHARED}/logs/a${k}.log" "${SHARED}/logs/b${k}.log"; done
 touch "${SHARED}/logs/mpiexec.log" "${SHARED}/logs/router.log"
 
-# 1 Hz GPU memory trace per node, launch to healthy only (jitter on a serving node).
+# 1 Hz GPU memory trace per node, launch to healthy only (jitter on a serving node);
+# GPU_WATCH_KEEP=1 runs it through the cells, cleanup stops it.
 cat > "${SHARED}/gpu_watch.sh" <<EOF
 #!/bin/bash
 while [ ! -f "${GPU_WATCH_STOP}" ]; do
@@ -215,8 +216,10 @@ wait_up() {
 }
 healthy=0
 wait_up "${A_IP}:${A_PORT}" /health A && wait_up "${B_IP}:${B_PORT}" /health B && healthy=1
-touch "${GPU_WATCH_STOP}"
-for i in "${!ENGINE[@]}"; do ssh -n "${NODES[$i]}" "pkill -f ${SHARED}/gpu_watch.sh" 2>/dev/null; done
+if [ "${GPU_WATCH_KEEP:-0}" != 1 ]; then
+    touch "${GPU_WATCH_STOP}"
+    for i in "${!ENGINE[@]}"; do ssh -n "${NODES[$i]}" "pkill -f ${SHARED}/gpu_watch.sh" 2>/dev/null; done
+fi
 kill -TERM "${TAIL_A_PID}" "${TAIL_B_PID}" "${TAIL_M_PID}" 2>/dev/null
 
 if [ "${healthy}" -ne 1 ]; then
