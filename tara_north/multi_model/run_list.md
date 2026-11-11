@@ -45,10 +45,12 @@ Muse-Spark-Open-816B-A42B, TP4 x PP8 per instance, EP off, 16 serving nodes.
 |---|---|---|---|
 | `run_muse_spark_router_sweep_tp4pp8_N16.sh` | Router arm: 2 colocated instances behind vllm-router (round robin). One boot, one warmup, then every cell in `CELLS`. | The router x2 baseline the P:D arm is compared against. | Current |
 | `run_muse_spark_pd_sweep_tp4pp8_N16.sh` | P:D arm, 1P:1D: P and D instances, NIXL push of the KV, toy proxy in front. One boot, one warmup, then every cell in `CELLS`. | The disaggregated arm under test. | Current |
-| `qsub_muse_spark_sweep_rt_smoke_N16.sh`, `..._pd_smoke_N16.sh` | Six short-to-long cells ending in one (8k, 1M) request per stream, GPU watch kept on. | Proves both arms, the NIXL 1M push, the hang watch and the 48 h client timeout before the 48 h pilots. | Current |
-| `qsub_muse_spark_sweep_rt_prefill_N16.sh`, `..._pd_prefill_N16.sh` | Pilot (1M, 8k) at c = 4, 8, 16, 32. | Prefill rate at full length; what happens past the KV cap. | Current |
-| `qsub_muse_spark_sweep_rt_decode_a_N16.sh`, `..._pd_decode_a_N16.sh` | Pilot (8k, 1M) at c = 4, 8. | Decode cost over a full 1M context. | Current |
-| `qsub_muse_spark_sweep_rt_decode_b_N16.sh`, `..._pd_decode_b_N16.sh` | Pilot (8k, 1M) at c = 16, at or over the cap. | Shows queueing vs preemption past the KV cap. | Current |
+| `qsub_muse_spark_sweep_rt_smoke_N16.sh`, `..._pd_smoke_N16.sh` | Six short-to-long cells ending in one (8k, 1M) request per stream, GPU watch kept on. | Proves both arms, the NIXL 1M push, the hang watch and the 48 h client timeout before the 48 h pilots. | Done (11417, 11418) |
+| `qsub_muse_spark_lean_rt_prefill_N16.sh`, `..._pd_prefill_N16.sh` | Lean pilot (1M, OSL) at c = 8, OSL = 8k, 16k, 32k, 40k. 12 h. | Router decode under prefill stalls vs P:D; where P:D shifts from P-bound to D-bound. | Current |
+| `qsub_muse_spark_lean_rt_dec8_N16.sh`, `..._pd_dec8_N16.sh` | Lean pilot (8k, 1M) at c = 8. Router 24 h, P:D 48 h. | 8 streams on D (the PP depth); router checks the step-time model's ~30 ms. | Current |
+| `qsub_muse_spark_sweep_rt_prefill_N16.sh`, `..._pd_prefill_N16.sh` | Pilot (1M, 8k) at c = 4, 8, 16, 32. | Prefill rate at full length; what happens past the KV cap. | Superseded by `lean_*` |
+| `qsub_muse_spark_sweep_rt_decode_a_N16.sh`, `..._pd_decode_a_N16.sh` | Pilot (8k, 1M) at c = 4, 8. | Decode cost over a full 1M context. | Superseded by `lean_*` |
+| `qsub_muse_spark_sweep_rt_decode_b_N16.sh`, `..._pd_decode_b_N16.sh` | Pilot (8k, 1M) at c = 16, at or over the cap. | Shows queueing vs preemption past the KV cap. | Superseded by `lean_*` |
 | `hang_watch.sh` | Started by both sweep runners. Fires on a vLLM ERROR line, a rank death, or 30 min with no progress while requests run; stops the bench. | A dead PP stage can leave the server answering `/health` while nothing moves. | Current |
 | `bench_serve_long_timeout.py` | `vllm bench serve` with a 48 h request timeout instead of the built-in 6 h. | A (8k, 1M) request runs for hours. | Current |
 | `toy_proxy_server_9e3db48873.py` | Verbatim copy of vLLM's NIXL test proxy at our vLLM pin. | Routes each request to P, then D, in the P:D arms. | Current |
