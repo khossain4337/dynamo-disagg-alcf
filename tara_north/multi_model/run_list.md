@@ -44,7 +44,7 @@ Muse-Spark-Open-816B-A42B, TP4 x PP8 per instance, EP off, 16 serving nodes.
 | File | What | Why | Status |
 |---|---|---|---|
 | `run_muse_spark_router_sweep_tp4pp8_N16.sh` | Router arm: 2 colocated instances behind vllm-router (round robin). One boot, one warmup, then every cell in `CELLS`. | The router x2 baseline the P:D arm is compared against. | Current |
-| `run_muse_spark_pd_sweep_tp4pp8_N16.sh` | P:D arm, 1P:1D: P and D instances, NIXL push of the KV, toy proxy in front. One boot, one warmup, then every cell in `CELLS`. | The disaggregated arm under test. | Current |
+| `run_muse_spark_pd_sweep_tp4pp8_N16.sh` | P:D arm, 1P:1D: P and D instances, NIXL push of the KV, toy proxy in front. One boot, one warmup, then every cell in `CELLS`. `engine_ttl:0` since 11-12 (edited in place). | The disaggregated arm under test. | Current |
 | `qsub_muse_spark_sweep_rt_smoke_N16.sh`, `..._pd_smoke_N16.sh` | Six short-to-long cells ending in one (8k, 1M) request per stream, GPU watch kept on. | Proves both arms, the NIXL 1M push, the hang watch and the 48 h client timeout before the 48 h pilots. | Done (11417, 11418) |
 | `qsub_muse_spark_lean_rt_prefill_N16.sh`, `..._pd_prefill_N16.sh` | Lean pilot (1M, OSL) at c = 8, OSL = 8k, 16k, 32k, 40k. 12 h. | Router decode under prefill stalls vs P:D; where P:D shifts from P-bound to D-bound. | Current |
 | `qsub_muse_spark_lean_rt_dec8_N16.sh`, `..._pd_dec8_N16.sh` | Lean pilot (8k, 1M) at c = 8. Router 24 h, P:D 48 h. | 8 streams on D (the PP depth); router checks the step-time model's ~30 ms. | Current |

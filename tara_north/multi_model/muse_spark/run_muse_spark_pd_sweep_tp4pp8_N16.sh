@@ -27,7 +27,8 @@ RUNS_ROOT=/vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS
 STAMP=$(date +%Y%m%d_%H%M%S)
 SHARED=${RUNS_ROOT}/muse_spark_pd_tp${TP}pp${PP}_ep${EP}_mml${MAX_MODEL_LEN}${RUN_TAG:+_${RUN_TAG}}_${STAMP}
 EP_FLAG=; [ "${EP}" = 1 ] && EP_FLAG=--enable-expert-parallel
-KV_EXTRA='"backends":["LIBFABRIC"],"kv_lease_duration":30'
+# engine_ttl 0: P evicts an idle D after 3600 s and the next push fails (DECISIONS -11-12).
+KV_EXTRA='"backends":["LIBFABRIC"],"kv_lease_duration":30,"engine_ttl":0'
 KV_P="{\"kv_connector\":\"NixlPushConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{${KV_EXTRA}}}"
 KV_D="{\"kv_connector\":\"NixlPushConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{${KV_EXTRA}}}"
 
