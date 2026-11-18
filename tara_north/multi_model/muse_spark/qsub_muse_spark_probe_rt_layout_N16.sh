@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -l select=19 -l place=scatter:excl
-#PBS -l walltime=03:00:00
+#PBS -l walltime=04:00:00
 #PBS -A inference_service
 #PBS -q workq
 #PBS -k doe
@@ -9,12 +9,12 @@
 #PBS -e /vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS/errordir_tara
 #PBS -j oe
 # Router per-token probe (DECISIONS -11-18a): two boots, teardown between. Boot 1 api servers 1, default
-# KV layout; boot 2 the same + LBHNC. (56k, 16k, 8) crosses context 65,536 mid-decode.
+# KV layout; boot 2 the same + LBHNC. (8k, 64k, 8): same context built by decode, not by a long prefill.
 TARA_NORTH=/vast/draco/tara/projects/Tara_Deployment/software/dynamo-disagg-alcf/tara_north
 MUSE_SPARK=${TARA_NORTH}/multi_model/muse_spark
 RUNS=/vast/draco/tara/projects/Tara_Deployment/software/testing/RUNS
 EP=0
-CELLS=(65536:8192:8 65536:8192:16 57344:16384:8)
+CELLS=(65536:8192:8 65536:8192:16 8192:65536:8)
 PROMPTS_PER_STREAM=2
 MAX_ATTEMPTS=3
 
